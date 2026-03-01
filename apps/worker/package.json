@@ -1,0 +1,22 @@
+{
+  "name": "grading-worker",
+  "version": "1.0.0",
+  "description": "Hybrid AI-Deterministic Grading Worker",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@google-cloud/vision": "^4.2.1",
+    "@google/generative-ai": "^0.2.1",
+    "@supabase/supabase-js": "^2.39.3",
+    "dotenv": "^16.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.24",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}

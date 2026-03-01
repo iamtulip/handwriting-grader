@@ -1,0 +1,47 @@
+-- [1] ปรับปรุงตารางผลการตรวจให้รองรับระบบ Audit และ Spec Drift
+ALTER TABLE public.grading_results 
+ADD COLUMN IF NOT EXISTS layout_spec_version INT DEFAULT 1,
+ADD COLUMN IF NOT EXISTS selected_candidate_id UUID REFERENCES public.grading_candidates(id),
+ADD COLUMN IF NOT EXISTS evidence_map JSONB,
+ADD COLUMN IF NOT EXISTS is_human_override BOOLEAN DEFAULT false,
+ADD COLUMN IF NOT EXISTS manual_reason TEXT,
+ADD COLUMN IF NOT EXISTS confidence_score NUMERIC;
+
+-- [2] ระบบป้องกันการบันทึกซ้ำ (Idempotency) ในตารางเหตุการณ์
+ALTER TABLE public.grading_events 
+ADD COLUMN IF NOT EXISTS client_nonce TEXT;
+
+-- [3] Index เพื่อประสิทธิภาพของ Reviewer Dashboard
+CREATE INDEX IF NOT EXISTS idx_grading_results_composite 
+ON public.grading_results (submission_id, roi_id, page_number, layout_spec_version);
+
+-- [4] RLS Policy สำหรับ Profiles ( Single Source of Truth )
+DROP POLICY IF EXISTS "Staff can view all profiles" ON public.profiles;
+CREATE POLICY "Staff can view all profiles" ON public.profiles 
+FOR SELECT USING (role IN ('reviewer', 'instructor', 'admin'));
+
+-- ปรับปรุง 
+-- สร้างตารางเก็บประวัติการตรวจสอบ (Append-only)
+CREATE TABLE IF NOT EXISTS public.grading_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    submission_id UUID NOT NULL REFERENCES public.submissions(id) ON DELETE CASCADE,
+    roi_id TEXT NOT NULL,
+    page_number INT NOT NULL DEFAULT 1,
+    layout_spec_version INT NOT NULL DEFAULT 1,
+    actor_id UUID NOT NULL REFERENCES public.profiles(id),
+    action_type TEXT NOT NULL CHECK (action_type IN ('confirm', 'override')),
+    before_data JSONB,
+    after_data JSONB,
+    manual_reason TEXT,
+    client_nonce TEXT UNIQUE, -- ป้องกันการยิงซ้ำ (Anti-replay)
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- ปรับปรุงตารางผลการตรวจให้รองรับระบบ Audit
+ALTER TABLE public.grading_results 
+ADD COLUMN IF NOT EXISTS layout_spec_version INT DEFAULT 1,
+ADD COLUMN IF NOT EXISTS selected_candidate_id UUID REFERENCES public.grading_candidates(id),
+ADD COLUMN IF NOT EXISTS evidence_map JSONB,
+ADD COLUMN IF NOT EXISTS is_human_override BOOLEAN DEFAULT false,
+ADD COLUMN IF NOT EXISTS manual_reason TEXT,
+ADD COLUMN IF NOT EXISTS confidence_score NUMERIC;

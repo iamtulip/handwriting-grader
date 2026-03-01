@@ -1,0 +1,15 @@
+
+# supabase/config.toml (ต้องเพิ่ม Config นี้เพื่อให้ Supabase ยอมให้เรายัด Role ลงไปใน JWT Token เพื่อแก้ปัญหา N+1 Query (Patch B))
+project_id = "grading-system"
+
+[api]
+port = 54321
+
+[auth]
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["http://localhost:3000/*"]
+
+# ✅ [Patch B] เปิดใช้งาน Custom JWT Hook เพื่อลด N+1 Query ใน RLS
+[auth.hook.custom_access_token]
+enabled = true
+uri = "pg-functions://postgres/public/custom_access_token_hook"
