@@ -1,0 +1,57 @@
+รูปแบบของ Json key
+
+{
+  "schema_version": 1,
+  "generated_mode": "manual",
+  "generated_at": "2026-03-19T12:00:00.000Z",
+  "items": [
+    {
+      "roi_id": "q1_answer",
+      "question_no": "1",
+      "subquestion_no": null,
+      "part_no": null,
+      "group_id": "q1",
+      "page_number": 1,
+      "expected_value": "1250",
+      "points": 1,
+      "answer_type": "number",
+      "grader": {
+        "mode": "deterministic",
+        "tolerance": {
+          "abs_tol": 0.01,
+          "rel_tol": 0
+        }
+      },
+      "source": "manual"
+    },
+    {
+      "roi_id": "q13_row1_interest",
+      "question_no": "13",
+      "subquestion_no": null,
+      "part_no": "row1_interest",
+      "group_id": "q13",
+      "page_number": 2,
+      "expected_value": "450.25",
+      "points": 0.5,
+      "answer_type": "number",
+      "grader": {
+        "mode": "deterministic",
+        "tolerance": {
+          "abs_tol": 0.01,
+          "rel_tol": 0
+        }
+      },
+      "source": "manual"
+    }
+  ]
+}
+
+
+Grading Config JSON ตัวอย่าง
+{
+  "schema_version": 1,
+  "document_type": "worksheet",
+  "page_count": 2,
+  "allow_multi_roi_per_question": true,
+  "enable_identity_verification": true
+}

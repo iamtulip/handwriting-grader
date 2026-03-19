@@ -45,3 +45,102 @@ ADD COLUMN IF NOT EXISTS evidence_map JSONB,
 ADD COLUMN IF NOT EXISTS is_human_override BOOLEAN DEFAULT false,
 ADD COLUMN IF NOT EXISTS manual_reason TEXT,
 ADD COLUMN IF NOT EXISTS confidence_score NUMERIC;
+
+
+-- =========================================================================
+-- MIGRATION 005: Meta-Scoring Engine, Policies, and Audit Logs
+-- =========================================================================
+
+-- 1) Assignment Type
+ALTER TABLE public.assignments
+ADD COLUMN IF NOT EXISTS assignment_type TEXT NOT NULL DEFAULT 'weekly_exercise'
+  CHECK (assignment_type IN ('weekly_exercise','quiz','midterm','final')),
+ADD COLUMN IF NOT EXISTS end_of_friday_at TIMESTAMPTZ; -- กำหนด deadline วันศุกร์แยกตามกลุ่ม
+
+-- 2) Scoring Policy Table
+CREATE TABLE IF NOT EXISTS public.assignment_scoring_policies (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  assignment_id UUID NOT NULL REFERENCES public.assignments(id) ON DELETE CASCADE,
+
+  total_points NUMERIC NOT NULL DEFAULT 5.0,
+
+  -- weights
+  w_attendance NUMERIC NOT NULL DEFAULT 1.0,
+  w_submit_in_class NUMERIC NOT NULL DEFAULT 1.5,
+  w_submit_same_day NUMERIC NOT NULL DEFAULT 1.0,
+  w_submit_by_friday NUMERIC NOT NULL DEFAULT 0.5,
+  w_accuracy NUMERIC NOT NULL DEFAULT 2.5,
+
+  is_online_class BOOLEAN NOT NULL DEFAULT false,
+  updated_by UUID REFERENCES public.profiles(id),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE(assignment_id)
+);
+
+-- 3) Validation Trigger: Sum(weights) MUST equal total_points
+CREATE OR REPLACE FUNCTION public.validate_scoring_policy()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  s numeric;
+BEGIN
+  s := NEW.w_attendance + NEW.w_submit_in_class + NEW.w_submit_same_day + NEW.w_submit_by_friday + NEW.w_accuracy;
+  IF abs(s - NEW.total_points) > 0.0001 THEN
+    RAISE EXCEPTION 'Invalid scoring policy: sum(weights)=%, total_points=%', s, NEW.total_points;
+  END IF;
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_validate_scoring_policy ON public.assignment_scoring_policies;
+CREATE TRIGGER trg_validate_scoring_policy
+BEFORE INSERT OR UPDATE ON public.assignment_scoring_policies
+FOR EACH ROW EXECUTE FUNCTION public.validate_scoring_policy();
+
+-- 4) Grading Results Breakdown
+ALTER TABLE public.grading_results
+ADD COLUMN IF NOT EXISTS meta_score_attendance NUMERIC NOT NULL DEFAULT 0,
+ADD COLUMN IF NOT EXISTS meta_score_punctuality NUMERIC NOT NULL DEFAULT 0,
+ADD COLUMN IF NOT EXISTS meta_score_accuracy NUMERIC NOT NULL DEFAULT 0,
+ADD COLUMN IF NOT EXISTS final_meta_score NUMERIC NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_grading_results_submission_roi ON public.grading_results(submission_id, roi_id);
+
+-- 5) Audit Log System: บันทึกประวัติถ้าอาจารย์แอบเปลี่ยนเกณฑ์หลังเซฟไปแล้ว
+CREATE TABLE IF NOT EXISTS public.policy_audit_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    policy_id UUID REFERENCES public.assignment_scoring_policies(id) ON DELETE CASCADE,
+    assignment_id UUID NOT NULL,
+    changed_by UUID REFERENCES public.profiles(id),
+    old_weights JSONB,
+    new_weights JSONB,
+    changed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE OR REPLACE FUNCTION public.log_policy_changes()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' THEN
+    INSERT INTO public.policy_audit_logs (policy_id, assignment_id, changed_by, old_weights, new_weights)
+    VALUES (
+      NEW.id, NEW.assignment_id, NEW.updated_by,
+      jsonb_build_object('att', OLD.w_attendance, 'in_class', OLD.w_submit_in_class, 'same_day', OLD.w_submit_same_day, 'fri', OLD.w_submit_by_friday, 'acc', OLD.w_accuracy, 'online', OLD.is_online_class),
+      jsonb_build_object('att', NEW.w_attendance, 'in_class', NEW.w_submit_in_class, 'same_day', NEW.w_submit_same_day, 'fri', NEW.w_submit_by_friday, 'acc', NEW.w_accuracy, 'online', NEW.is_online_class)
+    );
+  END IF;
+  RETURN NEW;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_log_policy_changes ON public.assignment_scoring_policies;
+CREATE TRIGGER trg_log_policy_changes
+AFTER UPDATE ON public.assignment_scoring_policies
+FOR EACH ROW EXECUTE FUNCTION public.log_policy_changes();
+
+-- RLS
+ALTER TABLE public.assignment_scoring_policies ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.policy_audit_logs ENABLE ROW LEVEL SECURITY;
+CREATE POLICY policy_read_all ON public.assignment_scoring_policies FOR SELECT USING (true);
+CREATE POLICY policy_write_staff ON public.assignment_scoring_policies FOR ALL USING (public.get_my_role() IN ('reviewer','admin'));

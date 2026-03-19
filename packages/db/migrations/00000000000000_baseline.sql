@@ -4,7 +4,7 @@
 -- ==========================================
 -- 1. ENUMS
 -- ==========================================
-DO $$ BEGIN CREATE TYPE public.user_role AS ENUM ('student', 'reviewer', 'admin'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE public.user_role AS ENUM ('student', 'reviewer', 'admin', 'instructor'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 DO $$ BEGIN CREATE TYPE public.submission_status AS ENUM (
   'uploaded', 'ocr_pending', 'ocr_running', 'ocr_done', 'ocr_failed',
   'extract_pending', 'extract_running', 'extract_done', 'extract_failed',

@@ -1,13 +1,8 @@
-// apps/web/lib/supabase/server.ts
-
-import 'server-only'
+import { createServerClient } from '@supabase/ssr'
+import { createClient as createJsClient } from '@supabase/supabase-js'
 import { cookies } from 'next/headers'
-import { createServerClient, type CookieOptions } from '@supabase/ssr'
-import { createClient as createAdmin } from '@supabase/supabase-js'
 
 export async function createClient() {
-
-  // ✅ Next 16 ต้อง await
   const cookieStore = await cookies()
 
   return createServerClient(
@@ -15,18 +10,15 @@ export async function createClient() {
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
     {
       cookies: {
-
         get(name: string) {
           return cookieStore.get(name)?.value
         },
-
-        set(name: string, value: string, options: CookieOptions) {
+        set(name: string, value: string, options: any) {
           try {
             cookieStore.set({ name, value, ...options })
           } catch {}
         },
-
-        remove(name: string, options: CookieOptions) {
+        remove(name: string, options: any) {
           try {
             cookieStore.set({ name, value: '', ...options })
           } catch {}
@@ -36,11 +28,19 @@ export async function createClient() {
   )
 }
 
-// ✅ bypass RLS
+/**
+ * Service-role client (ADMIN) - ใช้เฉพาะบน Server เท่านั้น
+ * - ห้าม import ไปใช้ใน client components เด็ดขาด
+ */
 export function createAdminClient() {
-  return createAdmin(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  )
+  const url = process.env.NEXT_PUBLIC_SUPABASE_URL
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+
+  if (!url || !serviceKey) {
+    throw new Error('Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY')
+  }
+
+  return createJsClient(url, serviceKey, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  })
 }

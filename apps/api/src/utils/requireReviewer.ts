@@ -1,18 +1,43 @@
-// apps/api/src/utils/requireReviewer.ts
 import { Request, Response, NextFunction } from 'express';
+import { getServiceSupabase } from '../lib/supabase';
+import { User } from '@supabase/supabase-js';
 
-// 1. สร้าง Interface ใหม่เพื่อบอก TypeScript ว่า Request ของเราจะมี .user แนบมาด้วย
 export interface AuthRequest extends Request {
-  user?: {
-    id: string;
-    role?: string;
-  };
+  user?: User;
 }
 
-// 2. สร้าง Middleware (ชั่วคราวไว้สำหรับให้ TypeScript ผ่าน และเตรียมเชื่อม Auth จริง)
-export const requireReviewer = (req: AuthRequest, res: Response, next: NextFunction) => {
-  // TODO: เชื่อมต่อตรวจสอบ JWT จาก Supabase ในอนาคต
-  // ตอนนี้จำลอง (Mock) ข้อมูล User ไปก่อนเพื่อให้ระบบทดสอบรันได้
-  req.user = { id: 'mock-reviewer-uuid-1234', role: 'reviewer' };
-  next();
+// ฟังก์ชันที่ 1 สำหรับนักศึกษา
+export const requireAuth = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
+    const token = authHeader.split(' ')[1];
+    const { data: { user }, error } = await getServiceSupabase().auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
+    req.user = user;
+    next();
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// ฟังก์ชันที่ 2 สำหรับอาจารย์
+export const requireReviewer = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  try {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).json({ error: 'Unauthorized' });
+    const token = authHeader.split(' ')[1];
+    const supa = getServiceSupabase();
+    const { data: { user }, error } = await supa.auth.getUser(token);
+    if (error || !user) return res.status(401).json({ error: 'Unauthorized' });
+
+    const { data: profile } = await supa.from('profiles').select('role').eq('id', user.id).single();
+    if (!profile || !['reviewer', 'admin', 'instructor'].includes(profile.role)) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    req.user = user;
+    next();
+  } catch (err) {
+    return res.status(500).json({ error: 'Internal server error' });
+  }
 };
