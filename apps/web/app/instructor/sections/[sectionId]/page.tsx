@@ -1,3 +1,4 @@
+//apps/web/app/instructor/sections/[sectionId]/page.tsx
 import Link from 'next/link'
 import { cookies } from 'next/headers'
 
@@ -25,9 +26,10 @@ async function getSectionDetail(sectionId: string) {
 export default async function InstructorSectionDetailPage({
   params,
 }: {
-  params: { sectionId: string }
+  params: Promise<{ sectionId: string }>
 }) {
-  const data = await getSectionDetail(params.sectionId)
+  const { sectionId } = await params
+  const data = await getSectionDetail(sectionId)
 
   return (
     <div className="space-y-8 max-w-7xl mx-auto">
@@ -39,9 +41,6 @@ export default async function InstructorSectionDetailPage({
           <p className="text-slate-600 mt-2 text-lg">
             ภาคการศึกษา {data.section.term}
           </p>
-          <div className="text-sm text-slate-500 mt-3">
-            เวลาเรียน: {data.section.start_time ?? '-'} ถึง {data.section.end_time ?? '-'}
-          </div>
         </div>
 
         <div className="flex gap-3">

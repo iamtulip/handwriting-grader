@@ -9,13 +9,16 @@
     "lint": "eslint"
   },
   "dependencies": {
+    "@google-cloud/documentai": "^9.6.0",
     "@supabase/ssr": "^0.8.0",
     "@supabase/supabase-js": "^2.98.0",
     "dotenv": "^17.3.1",
     "next": "16.1.6",
     "papaparse": "^5.5.3",
+    "pdfjs-dist": "^5.5.207",
     "react": "19.2.3",
     "react-dom": "19.2.3",
+    "react-pdf": "^10.4.1",
     "uuid": "^13.0.0",
     "xlsx": "^0.18.5"
   },

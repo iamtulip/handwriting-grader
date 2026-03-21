@@ -3,6 +3,42 @@ import { createClient } from '@/lib/supabase/server'
 
 export const runtime = 'nodejs'
 
+type AppRole = 'student' | 'reviewer' | 'instructor' | 'admin'
+
+type SectionRow = {
+  id: string
+  course_code: string
+  section_number: number
+  term: string
+  created_at: string | null
+}
+
+type InstructorSectionLinkRow = {
+  section_id: string | null
+}
+
+type ReviewerAssignmentRow = {
+  assignment_id: string
+  assignments:
+    | {
+        id: string
+        section_id: string | null
+      }
+    | Array<{
+        id: string
+        section_id: string | null
+      }>
+    | null
+}
+
+type SectionOnlyRow = {
+  section_id: string | null
+}
+
+function isPrivilegedRole(role: string): role is Extract<AppRole, 'reviewer' | 'instructor' | 'admin'> {
+  return ['instructor', 'reviewer', 'admin'].includes(role)
+}
+
 export async function GET() {
   const supabase = await createClient()
 
@@ -25,13 +61,13 @@ export async function GET() {
     return NextResponse.json({ error: meError.message }, { status: 500 })
   }
 
-  const role = me?.role ?? 'student'
+  const role: AppRole = (me?.role as AppRole | undefined) ?? 'student'
 
-  if (!['instructor', 'reviewer', 'admin'].includes(role)) {
+  if (!isPrivilegedRole(role)) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  let sections: any[] = []
+  let sections: SectionRow[] = []
 
   if (role === 'admin') {
     const { data, error } = await supabase
@@ -44,7 +80,7 @@ export async function GET() {
       return NextResponse.json({ error: error.message }, { status: 500 })
     }
 
-    sections = data ?? []
+    sections = (data ?? []) as SectionRow[]
   } else if (role === 'instructor') {
     const { data: instructorLinks, error: linkError } = await supabase
       .from('instructor_sections')
@@ -55,9 +91,9 @@ export async function GET() {
       return NextResponse.json({ error: linkError.message }, { status: 500 })
     }
 
-    const sectionIds = (instructorLinks ?? [])
-      .map((x: any) => x.section_id)
-      .filter(Boolean)
+    const sectionIds = ((instructorLinks ?? []) as InstructorSectionLinkRow[])
+      .map((x) => x.section_id)
+      .filter((id): id is string => Boolean(id))
 
     if (sectionIds.length === 0) {
       return NextResponse.json({ items: [] })
@@ -74,9 +110,9 @@ export async function GET() {
       return NextResponse.json({ error: error.message }, { status: 500 })
     }
 
-    sections = data ?? []
+    sections = (data ?? []) as SectionRow[]
   } else if (role === 'reviewer') {
-    const { data: reviewerAssignments, error: reviewerError } = await supabase
+    const { data: reviewerData, error: reviewerError } = await supabase
       .from('reviewer_assignments')
       .select(`
         assignment_id,
@@ -85,15 +121,19 @@ export async function GET() {
           section_id
         )
       `)
-      .eq('reviewer_id', user.id)
+      .eq('reviewer_user_id', user.id)
 
     if (reviewerError) {
       return NextResponse.json({ error: reviewerError.message }, { status: 500 })
     }
 
+    const reviewerAssignments = (reviewerData ?? []) as ReviewerAssignmentRow[]
+
     const sectionIdSet = new Set<string>()
-    for (const row of reviewerAssignments ?? []) {
-      const sid = row.assignments?.section_id
+
+    for (const row of reviewerAssignments) {
+      const rel = row.assignments
+      const sid = Array.isArray(rel) ? rel[0]?.section_id : rel?.section_id
       if (sid) sectionIdSet.add(sid)
     }
 
@@ -114,10 +154,10 @@ export async function GET() {
       return NextResponse.json({ error: error.message }, { status: 500 })
     }
 
-    sections = data ?? []
+    sections = (data ?? []) as SectionRow[]
   }
 
-  const sectionIds = sections.map((s: any) => s.id)
+  const sectionIds = sections.map((s) => s.id)
 
   if (sectionIds.length === 0) {
     return NextResponse.json({ items: [] })
@@ -125,9 +165,7 @@ export async function GET() {
 
   const [studentSectionsRes, assignmentsRes, sessionsRes] = await Promise.all([
     supabase.from('student_sections').select('section_id').in('section_id', sectionIds),
-
     supabase.from('assignments').select('id, section_id').in('section_id', sectionIds),
-
     supabase.from('class_sessions').select('id, section_id').in('section_id', sectionIds),
   ])
 
@@ -144,24 +182,27 @@ export async function GET() {
   }
 
   const studentCountMap = new Map<string, number>()
-  for (const row of studentSectionsRes.data ?? []) {
+  for (const row of ((studentSectionsRes.data ?? []) as SectionOnlyRow[])) {
     const key = row.section_id
+    if (!key) continue
     studentCountMap.set(key, (studentCountMap.get(key) ?? 0) + 1)
   }
 
   const assignmentCountMap = new Map<string, number>()
-  for (const row of assignmentsRes.data ?? []) {
+  for (const row of ((assignmentsRes.data ?? []) as SectionOnlyRow[])) {
     const key = row.section_id
+    if (!key) continue
     assignmentCountMap.set(key, (assignmentCountMap.get(key) ?? 0) + 1)
   }
 
   const sessionCountMap = new Map<string, number>()
-  for (const row of sessionsRes.data ?? []) {
+  for (const row of ((sessionsRes.data ?? []) as SectionOnlyRow[])) {
     const key = row.section_id
+    if (!key) continue
     sessionCountMap.set(key, (sessionCountMap.get(key) ?? 0) + 1)
   }
 
-  const items = sections.map((section: any) => ({
+  const items = sections.map((section) => ({
     ...section,
     schedule_day: null,
     start_time: null,

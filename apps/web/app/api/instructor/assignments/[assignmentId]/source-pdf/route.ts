@@ -1,97 +1,68 @@
 //apps/web/app/api/instructor/assignments/[assignmentId]/source-pdf/route.ts
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
+import { requireInstructorAssignmentAccess } from '@/lib/instructor-permissions'
 
 export const runtime = 'nodejs'
 
-async function canManageAssignment(
-  supabase: any,
-  userId: string,
-  role: string,
-  assignmentId: string
-) {
-  if (role === 'admin') return true
-
-  const { data: assignment } = await supabase
-    .from('assignments')
-    .select('section_id')
-    .eq('id', assignmentId)
-    .maybeSingle()
-
-  if (!assignment?.section_id) return false
-
-  const { data: access } = await supabase
-    .from('instructor_sections')
-    .select('id')
-    .eq('instructor_id', userId)
-    .eq('section_id', assignment.section_id)
-    .maybeSingle()
-
-  return !!access
-}
+const BUCKET = 'assignment-source-files'
+const FILE_KIND = 'source_pdf'
+const MAX_BYTES = 20 * 1024 * 1024
 
 export async function POST(
   req: Request,
-  { params }: { params: { assignmentId: string } }
+  context: { params: Promise<{ assignmentId: string }> }
 ) {
+  const { assignmentId } = await context.params
+
+  const access = await requireInstructorAssignmentAccess(assignmentId)
+  if (!access.ok) {
+    return NextResponse.json({ error: access.error }, { status: access.status })
+  }
+
+  const userId = access.userId!
   const supabase = await createClient()
-
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const { data: me } = await supabase
-    .from('user_profiles')
-    .select('role')
-    .eq('id', user.id)
-    .maybeSingle()
-
-  const role = me?.role ?? 'student'
-  if (!['instructor', 'admin'].includes(role)) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
-
-  const assignmentId = params.assignmentId
-  const allowed = await canManageAssignment(supabase, user.id, role, assignmentId)
-
-  if (!allowed) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
 
   const formData = await req.formData()
   const file = formData.get('file')
 
   if (!(file instanceof File)) {
-    return NextResponse.json({ error: 'Missing file' }, { status: 400 })
+    return NextResponse.json({ error: 'file is required' }, { status: 400 })
+  }
+
+  if (file.size <= 0) {
+    return NextResponse.json({ error: 'Uploaded PDF is empty' }, { status: 400 })
   }
 
   if (file.type !== 'application/pdf') {
     return NextResponse.json({ error: 'Only PDF files are allowed' }, { status: 400 })
   }
 
-  if (file.size <= 0) {
-    return NextResponse.json({ error: 'Empty file' }, { status: 400 })
+  if (file.size > MAX_BYTES) {
+    return NextResponse.json(
+      { error: 'PDF file is too large (max 20 MB)' },
+      { status: 400 }
+    )
   }
 
-  const maxBytes = 25 * 1024 * 1024
-  if (file.size > maxBytes) {
-    return NextResponse.json({ error: 'File too large (max 25 MB)' }, { status: 400 })
+  const { data: activeFiles, error: activeFilesError } = await supabase
+    .from('assignment_source_files')
+    .select('id, storage_path, original_filename')
+    .eq('assignment_id', assignmentId)
+    .eq('file_kind', FILE_KIND)
+    .eq('is_active', true)
+
+  if (activeFilesError) {
+    return NextResponse.json({ error: activeFilesError.message }, { status: 500 })
   }
 
-  const timestamp = Date.now()
-  const safeName = file.name.replace(/[^\w.\-]+/g, '_')
-  const storagePath = `assignments/${assignmentId}/source/${timestamp}_${safeName}`
-
-  const arrayBuffer = await file.arrayBuffer()
-  const buffer = Buffer.from(arrayBuffer)
+  const bytes = Buffer.from(await file.arrayBuffer())
+  const safeName = (file.name || 'source.pdf').replace(/[^\w.\-]+/g, '_')
+  const storagePath = `assignments/${assignmentId}/source/${Date.now()}_${safeName}`
 
   const { error: uploadError } = await supabase.storage
-    .from('exam-papers')
-    .upload(storagePath, buffer, {
+    .from(BUCKET)
+    .upload(storagePath, bytes, {
       contentType: 'application/pdf',
       upsert: false,
     })
@@ -100,31 +71,20 @@ export async function POST(
     return NextResponse.json({ error: uploadError.message }, { status: 500 })
   }
 
-  const { error: deactivateError } = await supabase
-    .from('assignment_source_files')
-    .update({
-      is_active: false,
-      replaced_at: new Date().toISOString(),
-    })
-    .eq('assignment_id', assignmentId)
-    .eq('file_kind', 'source_pdf')
-    .eq('is_active', true)
+  const now = new Date().toISOString()
 
-  if (deactivateError) {
-    return NextResponse.json({ error: deactivateError.message }, { status: 500 })
-  }
-
-  const { data: row, error: insertError } = await supabase
+  const { data: insertedRow, error: insertError } = await supabase
     .from('assignment_source_files')
     .insert({
       assignment_id: assignmentId,
-      file_kind: 'source_pdf',
+      file_kind: FILE_KIND,
       storage_path: storagePath,
       original_filename: file.name,
       mime_type: file.type,
       file_size_bytes: file.size,
-      uploaded_by: user.id,
+      uploaded_by: userId,
       is_active: true,
+      uploaded_at: now,
     })
     .select(`
       id,
@@ -134,75 +94,76 @@ export async function POST(
       original_filename,
       mime_type,
       file_size_bytes,
+      uploaded_by,
       is_active,
-      uploaded_at
+      uploaded_at,
+      replaced_at
     `)
     .single()
 
   if (insertError) {
+    await supabase.storage.from(BUCKET).remove([storagePath])
     return NextResponse.json({ error: insertError.message }, { status: 500 })
+  }
+
+  if ((activeFiles ?? []).length > 0) {
+    const activeIds = activeFiles.map((row) => row.id)
+
+    const { error: deactivateError } = await supabase
+      .from('assignment_source_files')
+      .update({
+        is_active: false,
+        replaced_at: now,
+      })
+      .in('id', activeIds)
+
+    if (deactivateError) {
+      return NextResponse.json(
+        {
+          error: deactivateError.message,
+          warning:
+            'New source PDF uploaded successfully, but previous active rows could not be deactivated automatically.',
+          file: insertedRow,
+        },
+        { status: 500 }
+      )
+    }
   }
 
   return NextResponse.json({
     ok: true,
-    file: row,
+    file: insertedRow,
+    replaced_count: activeFiles?.length ?? 0,
   })
 }
 
 export async function DELETE(
-  req: Request,
-  { params }: { params: { assignmentId: string } }
+  _req: Request,
+  context: { params: Promise<{ assignmentId: string }> }
 ) {
+  const { assignmentId } = await context.params
+
+  const access = await requireInstructorAssignmentAccess(assignmentId)
+  if (!access.ok) {
+    return NextResponse.json({ error: access.error }, { status: access.status })
+  }
+
   const supabase = await createClient()
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const { data: me } = await supabase
-    .from('user_profiles')
-    .select('role')
-    .eq('id', user.id)
-    .maybeSingle()
-
-  const role = me?.role ?? 'student'
-  if (!['instructor', 'admin'].includes(role)) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
-
-  const assignmentId = params.assignmentId
-  const allowed = await canManageAssignment(supabase, user.id, role, assignmentId)
-
-  if (!allowed) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
-
-  const { data: activeFile, error: fetchError } = await supabase
+  const { data: activeFile, error: activeError } = await supabase
     .from('assignment_source_files')
-    .select('id, storage_path')
+    .select('id, storage_path, original_filename')
     .eq('assignment_id', assignmentId)
-    .eq('file_kind', 'source_pdf')
+    .eq('file_kind', FILE_KIND)
     .eq('is_active', true)
     .maybeSingle()
 
-  if (fetchError) {
-    return NextResponse.json({ error: fetchError.message }, { status: 500 })
+  if (activeError) {
+    return NextResponse.json({ error: activeError.message }, { status: 500 })
   }
 
   if (!activeFile) {
     return NextResponse.json({ error: 'No active source PDF found' }, { status: 404 })
-  }
-
-  const { error: storageError } = await supabase.storage
-    .from('exam-papers')
-    .remove([activeFile.storage_path])
-
-  if (storageError) {
-    return NextResponse.json({ error: storageError.message }, { status: 500 })
   }
 
   const { error: updateError } = await supabase
@@ -217,5 +178,11 @@ export async function DELETE(
     return NextResponse.json({ error: updateError.message }, { status: 500 })
   }
 
-  return NextResponse.json({ ok: true })
+  return NextResponse.json({
+    ok: true,
+    removed: {
+      id: activeFile.id,
+      original_filename: activeFile.original_filename,
+    },
+  })
 }

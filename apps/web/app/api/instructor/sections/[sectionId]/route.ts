@@ -13,14 +13,26 @@ async function canAccessSection(
   if (role === 'admin') return true
 
   if (role === 'instructor') {
-    const { data } = await supabase
+    // 1) direct mapping via instructor_sections
+    const { data: directAccess } = await supabase
       .from('instructor_sections')
       .select('section_id')
       .eq('instructor_id', userId)
       .eq('section_id', sectionId)
       .maybeSingle()
 
-    return !!data
+    if (directAccess) return true
+
+    // 2) fallback via assignments created/owned in this section
+    const { data: assignmentAccess } = await supabase
+      .from('assignments')
+      .select('id')
+      .eq('section_id', sectionId)
+      .eq('created_by', userId)
+      .limit(1)
+      .maybeSingle()
+
+    return !!assignmentAccess
   }
 
   if (role === 'reviewer') {
@@ -28,7 +40,10 @@ async function canAccessSection(
       .from('reviewer_assignments')
       .select(`
         assignment_id,
-        assignments!inner(section_id)
+        assignments!inner(
+          id,
+          section_id
+        )
       `)
       .eq('reviewer_id', userId)
 
@@ -40,8 +55,10 @@ async function canAccessSection(
 
 export async function GET(
   _: Request,
-  { params }: { params: { sectionId: string } }
+  context: { params: Promise<{ sectionId: string }> }
 ) {
+  const { sectionId } = await context.params
+
   const supabase = await createClient()
 
   const {
@@ -63,7 +80,6 @@ export async function GET(
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  const sectionId = params.sectionId
   const allowed = await canAccessSection(supabase, user.id, role, sectionId)
 
   if (!allowed) {
@@ -72,7 +88,7 @@ export async function GET(
 
   const { data: section, error: sectionError } = await supabase
     .from('sections')
-    .select('id, course_code, section_number, term, schedule_day, start_time, end_time, created_at')
+    .select('id, course_code, section_number, term, created_at')
     .eq('id', sectionId)
     .maybeSingle()
 
@@ -110,7 +126,8 @@ export async function GET(
       due_at,
       close_at,
       end_of_friday_at,
-      created_at
+      created_at,
+      created_by
     `)
     .eq('section_id', sectionId)
     .order('class_date', { ascending: false })

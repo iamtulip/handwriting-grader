@@ -1,3 +1,4 @@
+//apps/web/types/layout-spec.ts
 export type LayoutDocumentType =
   | 'worksheet'
   | 'quiz'
@@ -68,7 +69,7 @@ export interface LayoutRegion {
   kind: RegionKind
   label?: string
 
-  question_no?: string | null
+  question_no?: number | null
   subquestion_no?: string | null
   part_no?: string | null
   group_id?: string | null
@@ -89,12 +90,15 @@ export interface LayoutRegion {
 export interface LayoutPage {
   page_number: number
   page_label?: string
+
   source_width?: number | null
   source_height?: number | null
+
   template_ref?: {
     pdf_page_index: number
     rotation?: number
   }
+
   regions: LayoutRegion[]
 }
 
@@ -110,8 +114,12 @@ export interface AssignmentLayoutDataV2 {
   document_type: LayoutDocumentType
   assignment_id?: string
   spec_name?: string
+
   page_count: number
+
   default_coordinate_space: LayoutCoordinateSpace
+
   settings: LayoutSettings
+
   pages: LayoutPage[]
 }

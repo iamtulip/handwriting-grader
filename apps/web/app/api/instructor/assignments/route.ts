@@ -9,17 +9,22 @@ export async function GET(req: Request) {
 
   const {
     data: { user },
+    error: authError,
   } = await supabase.auth.getUser()
 
-  if (!user) {
+  if (authError || !user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  const { data: me } = await supabase
+  const { data: me, error: meError } = await supabase
     .from('user_profiles')
-    .select('role')
+    .select('id, role, full_name')
     .eq('id', user.id)
     .maybeSingle()
+
+  if (meError) {
+    return NextResponse.json({ error: meError.message }, { status: 500 })
+  }
 
   const myRole = me?.role ?? 'student'
   if (!['instructor', 'admin'].includes(myRole)) {
@@ -30,23 +35,31 @@ export async function GET(req: Request) {
   const sectionId = url.searchParams.get('sectionId')
   const type = url.searchParams.get('type')
   const week = url.searchParams.get('week')
+  const archived = url.searchParams.get('archived')
 
   let allowedSectionIds: string[] = []
 
   if (myRole === 'admin') {
-    const { data: allSections } = await supabase
+    const { data: allSections, error } = await supabase
       .from('sections')
       .select('id')
-      .limit(500)
+
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 500 })
+    }
 
     allowedSectionIds = (allSections ?? []).map((s) => s.id)
   } else {
-    const { data: mine } = await supabase
+    const { data: mine, error } = await supabase
       .from('instructor_sections')
       .select('section_id')
       .eq('instructor_id', user.id)
 
-    allowedSectionIds = (mine ?? []).map((x) => x.section_id)
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 500 })
+    }
+
+    allowedSectionIds = (mine ?? []).map((x) => x.section_id).filter(Boolean)
   }
 
   if (allowedSectionIds.length === 0) {
@@ -63,11 +76,11 @@ export async function GET(req: Request) {
   }
 
   let query = supabase
-    .from('v_instructor_assignment_summary')
+    .from('assignments')
     .select(`
-      assignment_id,
-      section_id,
+      id,
       title,
+      description,
       assignment_type,
       week_number,
       class_date,
@@ -75,17 +88,15 @@ export async function GET(req: Request) {
       due_at,
       close_at,
       end_of_friday_at,
-      submission_count,
-      needs_review_count,
-      graded_count,
-      uploaded_count,
-      ocr_pending_count,
-      extract_pending_count,
-      grade_pending_count,
-      avg_total_score
+      section_id,
+      created_by,
+      created_by_user_id,
+      created_at,
+      updated_at
     `)
     .in('section_id', targetSectionIds)
-    .order('class_date', { ascending: false })
+    .order('class_date', { ascending: false, nullsFirst: false })
+    .order('created_at', { ascending: false })
 
   if (type) {
     query = query.eq('assignment_type', type)
@@ -95,7 +106,102 @@ export async function GET(req: Request) {
     query = query.eq('week_number', Number(week))
   }
 
-  const { data } = await query
+  // schema ปัจจุบันยังไม่มี is_archived ใน dump ล่าสุดของโปรเจ็กต์นี้หรืออาจมีจาก migration ภายหลัง
+  // จึงไม่ filter archived ที่ชั้น query เพื่อกัน route พัง ถ้าต้องการภายหลังค่อยเปิดใช้อีกครั้ง
+  const { data: assignments, error: assignmentsError } = await query
 
-  return NextResponse.json({ items: data ?? [] })
+  if (assignmentsError) {
+    return NextResponse.json({ error: assignmentsError.message }, { status: 500 })
+  }
+
+  const assignmentList = assignments ?? []
+  if (assignmentList.length === 0) {
+    return NextResponse.json({ items: [] })
+  }
+
+  const sectionIds = Array.from(
+    new Set(assignmentList.map((a) => a.section_id).filter(Boolean))
+  )
+
+  const { data: sections, error: sectionsError } = await supabase
+    .from('sections')
+    .select('id, course_code, section_number, term')
+    .in('id', sectionIds)
+
+  if (sectionsError) {
+    return NextResponse.json({ error: sectionsError.message }, { status: 500 })
+  }
+
+  const sectionMap = new Map<string, any>()
+  for (const section of sections ?? []) {
+    sectionMap.set(section.id, section)
+  }
+
+  const assignmentIds = assignmentList.map((a) => a.id)
+
+  const { data: submissions, error: submissionsError } = await supabase
+    .from('submissions')
+    .select('id, assignment_id, status, total_score, submitted_at')
+    .in('assignment_id', assignmentIds)
+
+  if (submissionsError) {
+    return NextResponse.json({ error: submissionsError.message }, { status: 500 })
+  }
+
+  const submissionMap = new Map<string, any[]>()
+  for (const sub of submissions ?? []) {
+    const list = submissionMap.get(sub.assignment_id) ?? []
+    list.push(sub)
+    submissionMap.set(sub.assignment_id, list)
+  }
+
+  const items = assignmentList.map((assignment) => {
+    const section = sectionMap.get(assignment.section_id) ?? null
+    const rows = submissionMap.get(assignment.id) ?? []
+
+    const submission_count = rows.length
+    const needs_review_count = rows.filter(
+      (r) => r.status === 'needs_review' || r.status === 'review_required'
+    ).length
+    const graded_count = rows.filter(
+      (r) => r.status === 'graded' || r.status === 'published'
+    ).length
+    const uploaded_count = rows.filter(
+      (r) => r.status === 'uploaded'
+    ).length
+
+    const avg_total_score =
+      submission_count > 0
+        ? rows.reduce((sum, r) => sum + Number(r.total_score ?? 0), 0) / submission_count
+        : 0
+
+    return {
+      id: assignment.id,
+      title: assignment.title,
+      description: assignment.description,
+      assignment_type: assignment.assignment_type,
+      week_number: assignment.week_number,
+      class_date: assignment.class_date,
+      open_at: assignment.open_at,
+      due_at: assignment.due_at,
+      close_at: assignment.close_at,
+      end_of_friday_at: assignment.end_of_friday_at,
+      section_id: assignment.section_id,
+      created_by: assignment.created_by,
+      created_by_user_id: assignment.created_by_user_id,
+      created_at: assignment.created_at,
+      updated_at: assignment.updated_at,
+      course_code: section?.course_code ?? null,
+      section_number: section?.section_number ?? null,
+      term: section?.term ?? null,
+      submission_count,
+      needs_review_count,
+      graded_count,
+      uploaded_count,
+      avg_total_score: Number(avg_total_score.toFixed(2)),
+      is_archived: false,
+    }
+  })
+
+  return NextResponse.json({ items })
 }

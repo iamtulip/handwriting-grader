@@ -1,8 +1,9 @@
+//apps/web/app/instructor/assignments/[assignmentId]/answer-key/page.tsx
 'use client'
 
 import Link from 'next/link'
 import { useEffect, useMemo, useState } from 'react'
-import { useParams, useRouter } from 'next/navigation'
+import { useParams } from 'next/navigation'
 
 function prettyJson(value: any) {
   return JSON.stringify(value, null, 2)
@@ -23,16 +24,15 @@ function defaultGradingConfigTemplate() {
   }
 }
 
-export default function AssignmentAnswerKeyEditorPage() {
+export default function AssignmentAnswerKeyPage() {
   const params = useParams<{ assignmentId: string }>()
-  const router = useRouter()
   const assignmentId = params.assignmentId
 
   const [loading, setLoading] = useState(true)
-  const [saving, setSaving] = useState(false)
+  const [busy, setBusy] = useState<'generate' | 'approve' | 'reject' | 'save' | null>(null)
+  const [item, setItem] = useState<any>(null)
   const [status, setStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
-  const [assignment, setAssignment] = useState<any>(null)
   const [answerKeyText, setAnswerKeyText] = useState(prettyJson(defaultAnswerKeyTemplate()))
   const [gradingConfigText, setGradingConfigText] = useState(
     prettyJson(defaultGradingConfigTemplate())
@@ -40,38 +40,22 @@ export default function AssignmentAnswerKeyEditorPage() {
   const [notes, setNotes] = useState('Manual answer key uploaded by staff')
 
   async function loadData() {
-    const [assignmentRes, answerKeyRes] = await Promise.all([
-      fetch(`/api/instructor/assignments/${assignmentId}`, {
-        cache: 'no-store',
-        headers: { Accept: 'application/json' },
-      }),
-      fetch(`/api/instructor/assignments/${assignmentId}/answer-key`, {
-        cache: 'no-store',
-        headers: { Accept: 'application/json' },
-      }),
-    ])
+    const res = await fetch(`/api/instructor/assignments/${assignmentId}/answer-key`, {
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+    })
 
-    const assignmentJson = await assignmentRes.json()
-    const answerKeyJson = await answerKeyRes.json()
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || 'Failed to load answer key')
 
-    if (!assignmentRes.ok) {
-      throw new Error(assignmentJson.error || 'Failed to load assignment')
-    }
+    setItem(data.item)
 
-    if (!answerKeyRes.ok) {
-      throw new Error(answerKeyJson.error || 'Failed to load answer key')
-    }
-
-    setAssignment(assignmentJson.assignment)
-
-    if (answerKeyJson.item) {
-      setAnswerKeyText(
-        prettyJson(answerKeyJson.item.answer_key ?? defaultAnswerKeyTemplate())
-      )
+    if (data.item) {
+      setAnswerKeyText(prettyJson(data.item.answer_key ?? defaultAnswerKeyTemplate()))
       setGradingConfigText(
-        prettyJson(answerKeyJson.item.grading_config ?? defaultGradingConfigTemplate())
+        prettyJson(data.item.grading_config ?? defaultGradingConfigTemplate())
       )
-      setNotes(answerKeyJson.item.generation_notes ?? 'Manual answer key uploaded by staff')
+      setNotes(data.item.generation_notes ?? 'Manual answer key uploaded by staff')
     }
   }
 
@@ -104,8 +88,52 @@ export default function AssignmentAnswerKeyEditorPage() {
     }
   }, [gradingConfigText])
 
-  async function saveManualAnswerKey() {
-    setSaving(true)
+  async function doAction(action: 'generate' | 'approve' | 'reject') {
+    setBusy(action)
+    setStatus(null)
+
+    try {
+      const res = await fetch(`/api/instructor/assignments/${assignmentId}/answer-key`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          action,
+          generation_notes:
+            action === 'reject' ? 'Rejected by instructor/reviewer' : undefined,
+        }),
+      })
+
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || `${action} failed`)
+
+      setItem(data.item)
+      setAnswerKeyText(prettyJson(data.item.answer_key ?? defaultAnswerKeyTemplate()))
+      setGradingConfigText(
+        prettyJson(data.item.grading_config ?? defaultGradingConfigTemplate())
+      )
+      setNotes(data.item.generation_notes ?? '')
+
+      setStatus({
+        type: 'success',
+        text:
+          action === 'generate'
+            ? 'Generate AI Answer Key สำเร็จ'
+            : action === 'approve'
+            ? 'Approve Answer Key สำเร็จ'
+            : 'Reject Answer Key สำเร็จ',
+      })
+    } catch (e: any) {
+      setStatus({ type: 'error', text: e.message || 'ทำรายการไม่สำเร็จ' })
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  async function saveManual() {
+    setBusy('save')
     setStatus(null)
 
     try {
@@ -118,7 +146,7 @@ export default function AssignmentAnswerKeyEditorPage() {
       }
 
       const res = await fetch(`/api/instructor/assignments/${assignmentId}/answer-key`, {
-        method: 'PATCH',
+        method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Accept: 'application/json',
@@ -131,14 +159,15 @@ export default function AssignmentAnswerKeyEditorPage() {
         }),
       })
 
-      const json = await res.json()
-      if (!res.ok) throw new Error(json.error || 'Save failed')
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error || 'Save failed')
 
+      setItem(data.item)
       setStatus({ type: 'success', text: 'บันทึก Manual Answer Key สำเร็จ' })
     } catch (e: any) {
       setStatus({ type: 'error', text: e.message || 'บันทึกไม่สำเร็จ' })
     } finally {
-      setSaving(false)
+      setBusy(null)
     }
   }
 
@@ -160,34 +189,34 @@ export default function AssignmentAnswerKeyEditorPage() {
   }
 
   if (loading) {
-    return <div className="p-8">กำลังโหลด Answer Key Editor...</div>
+    return <div className="p-8">กำลังโหลด answer key...</div>
   }
 
   return (
-    <div className="space-y-6 max-w-7xl mx-auto">
-      <header className="flex items-start justify-between gap-4 border-b border-slate-200 pb-6">
+    <div className="space-y-8 max-w-7xl mx-auto">
+      <header className="flex items-start justify-between gap-6 border-b border-slate-200 pb-6">
         <div>
-          <h1 className="text-3xl font-extrabold text-slate-900">Manual Answer Key Editor</h1>
+          <h1 className="text-3xl font-extrabold text-slate-900">Answer Key</h1>
           <p className="text-slate-600 mt-2 text-lg">
-            {assignment?.title ?? 'Assignment'}
+            สร้าง ตรวจ และแก้ไขเฉลยของ assignment
           </p>
+          <div className="text-sm text-slate-500 mt-2">Assignment ID: {assignmentId}</div>
         </div>
 
-        <div className="flex gap-3">
+        <div className="flex flex-wrap gap-3">
           <Link
             href={`/instructor/assignments/${assignmentId}`}
             className="px-4 py-2 rounded-lg bg-slate-100 text-slate-700 font-semibold hover:bg-slate-200"
           >
-            กลับหน้า Assignment
+            กลับ Workspace
           </Link>
-          <button
-            type="button"
-            onClick={saveManualAnswerKey}
-            disabled={saving}
-            className="px-4 py-2 rounded-lg bg-blue-600 text-white font-bold hover:bg-blue-700 disabled:bg-blue-300"
+
+          <Link
+            href={`/instructor/assignments/${assignmentId}/files`}
+            className="px-4 py-2 rounded-lg bg-blue-600 text-white font-bold hover:bg-blue-700"
           >
-            {saving ? 'กำลังบันทึก...' : 'Save Manual Answer Key'}
-          </button>
+            ไปหน้า Files
+          </Link>
         </div>
       </header>
 
@@ -202,6 +231,54 @@ export default function AssignmentAnswerKeyEditorPage() {
           {status.text}
         </div>
       )}
+
+      <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
+        <InfoCard title="Generation Status" value={item?.generation_status ?? 'not_started'} />
+        <InfoCard title="Approval Status" value={item?.approval_status ?? 'draft'} />
+        <InfoCard title="Generated by AI" value={item?.generated_by_ai ? 'YES' : 'NO'} />
+        <InfoCard title="AI Model" value={item?.ai_model ?? '-'} />
+      </section>
+
+      <section className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+        <div className="font-bold text-slate-900 text-lg mb-4">Actions</div>
+        <div className="flex flex-wrap gap-3">
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() => doAction('generate')}
+            className="px-4 py-2 rounded-lg bg-purple-600 text-white font-bold hover:bg-purple-700 disabled:bg-purple-300"
+          >
+            {busy === 'generate' ? 'กำลังสร้าง...' : 'Generate AI Answer Key'}
+          </button>
+
+          <button
+            type="button"
+            disabled={busy !== null || !item}
+            onClick={() => doAction('approve')}
+            className="px-4 py-2 rounded-lg bg-emerald-600 text-white font-bold hover:bg-emerald-700 disabled:bg-emerald-300"
+          >
+            {busy === 'approve' ? 'กำลังอนุมัติ...' : 'Approve'}
+          </button>
+
+          <button
+            type="button"
+            disabled={busy !== null || !item}
+            onClick={() => doAction('reject')}
+            className="px-4 py-2 rounded-lg bg-amber-600 text-white font-bold hover:bg-amber-700 disabled:bg-amber-300"
+          >
+            {busy === 'reject' ? 'กำลัง reject...' : 'Reject'}
+          </button>
+
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={saveManual}
+            className="px-4 py-2 rounded-lg bg-blue-600 text-white font-bold hover:bg-blue-700 disabled:bg-blue-300"
+          >
+            {busy === 'save' ? 'กำลังบันทึก...' : 'Save Manual JSON'}
+          </button>
+        </div>
+      </section>
 
       <section className="grid grid-cols-1 xl:grid-cols-2 gap-6">
         <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-4">
@@ -221,7 +298,7 @@ export default function AssignmentAnswerKeyEditorPage() {
           <textarea
             value={answerKeyText}
             onChange={(e) => setAnswerKeyText(e.target.value)}
-            className="w-full min-h-[500px] rounded-xl border border-slate-300 p-4 font-mono text-sm"
+            className="w-full min-h-[520px] rounded-xl border border-slate-300 p-4 font-mono text-sm"
             spellCheck={false}
           />
 
@@ -253,7 +330,7 @@ export default function AssignmentAnswerKeyEditorPage() {
           <textarea
             value={gradingConfigText}
             onChange={(e) => setGradingConfigText(e.target.value)}
-            className="w-full min-h-[380px] rounded-xl border border-slate-300 p-4 font-mono text-sm"
+            className="w-full min-h-[320px] rounded-xl border border-slate-300 p-4 font-mono text-sm"
             spellCheck={false}
           />
 
@@ -268,17 +345,41 @@ export default function AssignmentAnswerKeyEditorPage() {
           </div>
 
           <div>
-            <label className="block text-sm font-bold text-slate-700 mb-2">
-              Notes
-            </label>
+            <label className="block text-sm font-bold text-slate-700 mb-2">Notes</label>
             <textarea
               value={notes}
               onChange={(e) => setNotes(e.target.value)}
-              className="w-full min-h-[100px] rounded-xl border border-slate-300 p-4 text-sm"
+              className="w-full min-h-[120px] rounded-xl border border-slate-300 p-4 text-sm"
             />
+          </div>
+
+          <div className="rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
+            <div>Updated At: {formatDateTime(item?.updated_at)}</div>
+            <div>Approved At: {formatDateTime(item?.approved_at)}</div>
+            <div>Source File ID: {item?.source_file_id ?? '-'}</div>
+            <div>Source PDF Path: {item?.source_pdf_path ?? '-'}</div>
+            <div>Last Error: {item?.last_generation_error ?? '-'}</div>
           </div>
         </div>
       </section>
     </div>
   )
+}
+
+function InfoCard({ title, value }: { title: string; value: string }) {
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
+      <div className="text-sm text-slate-500 font-medium">{title}</div>
+      <div className="text-xl font-extrabold text-slate-900 mt-2">{value}</div>
+    </div>
+  )
+}
+
+function formatDateTime(value?: string | null) {
+  if (!value) return '-'
+  try {
+    return new Date(value).toLocaleString('th-TH')
+  } catch {
+    return value
+  }
 }

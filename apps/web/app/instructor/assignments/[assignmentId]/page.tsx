@@ -1,25 +1,132 @@
+
+//apps/web/app/instructor/assignments/[assignmentId]/page.tsx
 'use client'
 
 import Link from 'next/link'
-import { useEffect, useState } from 'react'
-import { useParams } from 'next/navigation'
+import { useEffect, useMemo, useState } from 'react'
+import { useParams, useRouter } from 'next/navigation'
+
+type StatusMessage = {
+  type: 'success' | 'error'
+  text: string
+}
+
+type AssignmentDetailResponse = {
+  assignment: {
+    id: string
+    title: string
+    description?: string | null
+    assignment_type?: string | null
+    week_number?: number | null
+    class_date?: string | null
+    open_at?: string | null
+    due_at?: string | null
+    close_at?: string | null
+    end_of_friday_at?: string | null
+    created_at?: string | null
+    updated_at?: string | null
+  }
+  section: {
+    id: string
+    course_code?: string | null
+    section_number?: string | number | null
+    term?: string | null
+  } | null
+  sourcePdf: {
+    exists: boolean
+    id?: string | null
+    original_filename?: string | null
+    mime_type?: string | null
+    file_size_bytes?: number | null
+    uploaded_at?: string | null
+    storage_path?: string | null
+  }
+  layoutSpec: {
+    id: string
+    version?: number | null
+    is_active?: boolean | null
+    schema_version?: number | null
+    spec_name?: string | null
+    page_count?: number | null
+    layout_status?: string | null
+    approved_at?: string | null
+    created_at?: string | null
+  } | null
+  activeLayoutSpec?: {
+    id: string
+    version?: number | null
+    is_active?: boolean | null
+    schema_version?: number | null
+    spec_name?: string | null
+    page_count?: number | null
+    layout_status?: string | null
+    approved_at?: string | null
+    created_at?: string | null
+  } | null
+  latestLayoutSpec?: {
+    id: string
+    version?: number | null
+    is_active?: boolean | null
+    schema_version?: number | null
+    spec_name?: string | null
+    page_count?: number | null
+    layout_status?: string | null
+    approved_at?: string | null
+    created_at?: string | null
+  } | null
+  layoutVersions?: Array<{
+    id: string
+    version?: number | null
+    is_active?: boolean | null
+    schema_version?: number | null
+    spec_name?: string | null
+    page_count?: number | null
+    layout_status?: string | null
+    approved_at?: string | null
+    created_at?: string | null
+  }>
+  answerKey: {
+    exists: boolean
+    updated_at?: string | null
+    source_pdf_path?: string | null
+    source_file_id?: string | null
+    generation_status?: string | null
+    generated_by_ai?: boolean | null
+    ai_model?: string | null
+    approval_status?: string | null
+    approved_by?: string | null
+    approved_at?: string | null
+    generation_notes?: string | null
+    last_generation_error?: string | null
+    grading_config?: any
+    item_count?: number
+  }
+  summary?: {
+    submission_count?: number
+    needs_review_count?: number
+    graded_count?: number
+    uploaded_count?: number
+    ocr_pending_count?: number
+    extract_pending_count?: number
+    grade_pending_count?: number
+    avg_total_score?: number
+  }
+}
 
 export default function InstructorAssignmentDetailPage() {
   const params = useParams<{ assignmentId: string }>()
+  const router = useRouter()
   const assignmentId = params.assignmentId
 
+  const [data, setData] = useState<AssignmentDetailResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
   const [removing, setRemoving] = useState(false)
   const [generating, setGenerating] = useState(false)
   const [approving, setApproving] = useState(false)
   const [rejecting, setRejecting] = useState(false)
-
-  const [data, setData] = useState<any>(null)
-  const [status, setStatus] = useState<{
-    type: 'success' | 'error'
-    text: string
-  } | null>(null)
+  const [status, setStatus] = useState<StatusMessage | null>(null)
+  const [selectedFile, setSelectedFile] = useState<File | null>(null)
 
   async function loadData() {
     const res = await fetch(`/api/instructor/assignments/${assignmentId}`, {
@@ -28,58 +135,92 @@ export default function InstructorAssignmentDetailPage() {
     })
 
     const json = await res.json()
-    if (!res.ok) throw new Error(json.error || 'Failed to load assignment detail')
+    if (!res.ok) {
+      throw new Error(json.error || 'Failed to load assignment details')
+    }
+
     setData(json)
   }
 
   useEffect(() => {
     const run = async () => {
       try {
+        setLoading(true)
+        setStatus(null)
         await loadData()
       } catch (e: any) {
         setStatus({
           type: 'error',
-          text: e.message || 'โหลด assignment ไม่สำเร็จ',
+          text: e?.message || 'โหลดข้อมูล assignment ไม่สำเร็จ',
         })
       } finally {
         setLoading(false)
       }
     }
+
     run()
   }, [assignmentId])
 
-  async function onUploadFile(file: File) {
+  const sourceReady = !!data?.sourcePdf?.exists
+  const layoutReady = !!data?.layoutSpec
+  const activeLayoutReady = !!data?.activeLayoutSpec
+  const approvedLayoutReady =
+    !!data?.activeLayoutSpec &&
+    ['approved', 'active', 'ready'].includes(
+      String(data?.activeLayoutSpec?.layout_status ?? '').toLowerCase()
+    )
+
+  const canGenerate = sourceReady && layoutReady
+  const canApproveAnswerKey = !!data?.answerKey?.exists
+  const canRejectAnswerKey = !!data?.answerKey?.exists
+
+  const sectionLabel = useMemo(() => {
+    if (!data?.section) return 'Unknown section'
+
+    return `${data.section.course_code ?? '-'} - Sec ${data.section.section_number ?? '-'} (${data.section.term ?? '-'})`
+  }, [data?.section])
+
+  async function handleUploadSourcePdf() {
+    if (!selectedFile) {
+      setStatus({ type: 'error', text: 'กรุณาเลือกไฟล์ PDF ก่อน' })
+      return
+    }
+
     setUploading(true)
     setStatus(null)
 
     try {
-      const form = new FormData()
-      form.append('file', file)
+      const formData = new FormData()
+      formData.append('file', selectedFile)
 
       const res = await fetch(
         `/api/instructor/assignments/${assignmentId}/source-pdf`,
         {
           method: 'POST',
-          body: form,
+          body: formData,
         }
       )
 
       const json = await res.json()
-      if (!res.ok) throw new Error(json.error || 'Upload failed')
+      if (!res.ok) {
+        throw new Error(json.error || 'Upload source PDF failed')
+      }
 
-      setStatus({ type: 'success', text: 'อัปโหลด PDF สำเร็จ' })
+      setSelectedFile(null)
+      setStatus({ type: 'success', text: 'อัปโหลด source PDF สำเร็จ' })
       await loadData()
+      router.refresh()
     } catch (e: any) {
       setStatus({
         type: 'error',
-        text: e.message || 'อัปโหลด PDF ไม่สำเร็จ',
+        text: e?.message || 'อัปโหลด source PDF ไม่สำเร็จ',
       })
     } finally {
       setUploading(false)
     }
   }
 
-  async function removePdf() {
+  async function handleRemoveSourcePdf() {
     setRemoving(true)
     setStatus(null)
 
@@ -88,19 +229,21 @@ export default function InstructorAssignmentDetailPage() {
         `/api/instructor/assignments/${assignmentId}/source-pdf`,
         {
           method: 'DELETE',
-          headers: { Accept: 'application/json' },
         }
       )
 
       const json = await res.json()
-      if (!res.ok) throw new Error(json.error || 'Delete failed')
+      if (!res.ok) {
+        throw new Error(json.error || 'Remove source PDF failed')
+      }
 
       setStatus({ type: 'success', text: 'ลบ source PDF สำเร็จ' })
       await loadData()
+      router.refresh()
     } catch (e: any) {
       setStatus({
         type: 'error',
-        text: e.message || 'ลบ source PDF ไม่สำเร็จ',
+        text: e?.message || 'ลบ source PDF ไม่สำเร็จ',
       })
     } finally {
       setRemoving(false)
@@ -113,7 +256,7 @@ export default function InstructorAssignmentDetailPage() {
 
     try {
       const res = await fetch(
-        `/api/instructor/assignments/${assignmentId}/generate-answer-key`,
+        `/api/instructor/assignments/${assignmentId}/answer-key/generate`,
         {
           method: 'POST',
           headers: { Accept: 'application/json' },
@@ -121,17 +264,17 @@ export default function InstructorAssignmentDetailPage() {
       )
 
       const json = await res.json()
-      if (!res.ok) throw new Error(json.error || 'Generate failed')
+      if (!res.ok) {
+        throw new Error(json.error || 'Generate answer key failed')
+      }
 
-      setStatus({
-        type: 'success',
-        text: `สร้าง AI answer key scaffold สำเร็จ (${json.preview?.item_count ?? 0} items)`,
-      })
+      setStatus({ type: 'success', text: 'สั่งสร้าง answer key สำเร็จ' })
       await loadData()
+      router.refresh()
     } catch (e: any) {
       setStatus({
         type: 'error',
-        text: e.message || 'สร้าง answer key ไม่สำเร็จ',
+        text: e?.message || 'สร้าง answer key ไม่สำเร็จ',
       })
     } finally {
       setGenerating(false)
@@ -144,26 +287,25 @@ export default function InstructorAssignmentDetailPage() {
 
     try {
       const res = await fetch(
-        `/api/instructor/assignments/${assignmentId}/answer-key`,
+        `/api/instructor/assignments/${assignmentId}/answer-key/approve`,
         {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
-          body: JSON.stringify({ action: 'approve' }),
+          method: 'POST',
+          headers: { Accept: 'application/json' },
         }
       )
 
       const json = await res.json()
-      if (!res.ok) throw new Error(json.error || 'Approve failed')
+      if (!res.ok) {
+        throw new Error(json.error || 'Approve answer key failed')
+      }
 
       setStatus({ type: 'success', text: 'อนุมัติ answer key สำเร็จ' })
       await loadData()
+      router.refresh()
     } catch (e: any) {
       setStatus({
         type: 'error',
-        text: e.message || 'อนุมัติ answer key ไม่สำเร็จ',
+        text: e?.message || 'อนุมัติ answer key ไม่สำเร็จ',
       })
     } finally {
       setApproving(false)
@@ -176,32 +318,25 @@ export default function InstructorAssignmentDetailPage() {
 
     try {
       const res = await fetch(
-        `/api/instructor/assignments/${assignmentId}/answer-key`,
+        `/api/instructor/assignments/${assignmentId}/answer-key/reject`,
         {
-          method: 'PATCH',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/json',
-          },
-          body: JSON.stringify({
-            action: 'reject',
-            generation_notes: 'Rejected by instructor/reviewer for manual revision',
-          }),
+          method: 'POST',
+          headers: { Accept: 'application/json' },
         }
       )
 
       const json = await res.json()
-      if (!res.ok) throw new Error(json.error || 'Reject failed')
+      if (!res.ok) {
+        throw new Error(json.error || 'Reject answer key failed')
+      }
 
-      setStatus({
-        type: 'success',
-        text: 'เปลี่ยนสถานะ answer key เป็น rejected แล้ว',
-      })
+      setStatus({ type: 'success', text: 'ส่ง answer key กลับแก้ไขสำเร็จ' })
       await loadData()
+      router.refresh()
     } catch (e: any) {
       setStatus({
         type: 'error',
-        text: e.message || 'reject answer key ไม่สำเร็จ',
+        text: e?.message || 'ส่ง answer key กลับแก้ไขไม่สำเร็จ',
       })
     } finally {
       setRejecting(false)
@@ -209,45 +344,32 @@ export default function InstructorAssignmentDetailPage() {
   }
 
   if (loading) {
-    return <div className="p-8">กำลังโหลด Assignment Workspace...</div>
+    return <div className="p-8">กำลังโหลดข้อมูล assignment...</div>
   }
 
   if (!data) {
     return <div className="p-8 text-red-600">ไม่พบข้อมูล assignment</div>
   }
 
-  const canGenerate = data.sourcePdf?.exists && data.layoutSpec
-
   return (
-    <div className="space-y-8 max-w-7xl mx-auto">
+    <div className="space-y-8 max-w-6xl mx-auto">
       <header className="flex items-start justify-between gap-6 border-b border-slate-200 pb-6">
         <div>
           <h1 className="text-3xl font-extrabold text-slate-900">
             {data.assignment.title}
           </h1>
-          <p className="text-slate-600 mt-2 text-lg">
-            {data.section
-              ? `${data.section.course_code} - Sec ${data.section.section_number} (${data.section.term})`
-              : 'Unknown section'}
-          </p>
-          <div className="text-sm text-slate-500 mt-3">
+          <div className="text-slate-600 mt-2">{sectionLabel}</div>
+          <div className="text-sm text-slate-500 mt-2">
             Assignment ID: {data.assignment.id}
           </div>
         </div>
 
-        <div className="flex flex-wrap gap-3">
+        <div className="flex gap-3">
           <Link
-            href="/instructor/assignments"
+            href="/instructor/dashboard"
             className="px-4 py-2 rounded-lg bg-slate-100 text-slate-700 font-semibold hover:bg-slate-200"
           >
-            กลับรายการงาน
-          </Link>
-
-          <Link
-            href={`/instructor/assignments/${data.assignment.id}/layout`}
-            className="px-4 py-2 rounded-lg bg-blue-600 text-white font-bold hover:bg-blue-700"
-          >
-            เปิด Layout Editor
+            กลับ Dashboard
           </Link>
         </div>
       </header>
@@ -265,309 +387,380 @@ export default function InstructorAssignmentDetailPage() {
       )}
 
       <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
-        <StatCard
+        <InfoCard
           title="Submissions"
-          value={String(data.summary.submission_count ?? 0)}
+          value={String(data.summary?.submission_count ?? 0)}
         />
-        <StatCard
+        <InfoCard
           title="Needs Review"
-          value={String(data.summary.needs_review_count ?? 0)}
-          valueClassName="text-red-600"
+          value={String(data.summary?.needs_review_count ?? 0)}
         />
-        <StatCard
+        <InfoCard
           title="Graded"
-          value={String(data.summary.graded_count ?? 0)}
-          valueClassName="text-emerald-600"
+          value={String(data.summary?.graded_count ?? 0)}
         />
-        <StatCard
+        <InfoCard
           title="Avg Score"
-          value={Number(data.summary.avg_total_score ?? 0).toFixed(2)}
-          valueClassName="text-blue-600"
+          value={String(data.summary?.avg_total_score ?? 0)}
         />
       </section>
 
-      <section className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-        <div className="xl:col-span-2 bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
-          <div className="font-bold text-slate-800 text-lg mb-4">
-            Assignment Metadata
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-            <Row label="Title" value={data.assignment.title ?? '-'} />
-            <Row label="Type" value={data.assignment.assignment_type ?? '-'} />
-            <Row
-              label="Week Number"
-              value={String(data.assignment.week_number ?? '-')}
-            />
-            <Row label="Class Date" value={data.assignment.class_date ?? '-'} />
-            <Row label="Open At" value={formatDateTime(data.assignment.open_at)} />
-            <Row label="Due At" value={formatDateTime(data.assignment.due_at)} />
-            <Row
-              label="Close At"
-              value={formatDateTime(data.assignment.close_at)}
-            />
-            <Row
-              label="End of Friday At"
-              value={formatDateTime(data.assignment.end_of_friday_at)}
-            />
-          </div>
-
-          <div className="mt-6 border-t border-slate-200 pt-6">
-            <div className="font-bold text-slate-800 mb-2">Description</div>
-            <div className="text-slate-600 whitespace-pre-wrap">
-              {data.assignment.description || '-'}
-            </div>
-          </div>
+      <section className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-3">
+          <div className="font-bold text-slate-900 text-lg">Assignment Info</div>
+          <InfoRow label="Title" value={data.assignment.title ?? '-'} />
+          <InfoRow
+            label="Description"
+            value={data.assignment.description ?? '-'}
+          />
+          <InfoRow
+            label="Type"
+            value={data.assignment.assignment_type ?? '-'}
+          />
+          <InfoRow
+            label="Week"
+            value={String(data.assignment.week_number ?? '-')}
+          />
+          <InfoRow
+            label="Class Date"
+            value={formatDateTime(data.assignment.class_date)}
+          />
+          <InfoRow
+            label="Open At"
+            value={formatDateTime(data.assignment.open_at)}
+          />
+          <InfoRow
+            label="Due At"
+            value={formatDateTime(data.assignment.due_at)}
+          />
+          <InfoRow
+            label="Close At"
+            value={formatDateTime(data.assignment.close_at)}
+          />
+          <InfoRow
+            label="Updated At"
+            value={formatDateTime(data.assignment.updated_at)}
+          />
         </div>
 
-        <div className="space-y-6">
-          <WorkspaceCard
-            title="Source PDF"
-            status={data.sourcePdf?.exists ? 'uploaded' : 'missing'}
-          >
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-3">
+          <div className="font-bold text-slate-900 text-lg">Workflow Readiness</div>
+          <ReadinessRow label="Source PDF" ready={sourceReady} />
+          <ReadinessRow label="Any Layout" ready={layoutReady} />
+          <ReadinessRow label="Active Layout" ready={activeLayoutReady} />
+          <ReadinessRow label="Approved Layout" ready={approvedLayoutReady} />
+          <ReadinessRow label="Can Generate Answer Key" ready={canGenerate} />
+          <ReadinessRow
+            label="Answer Key Exists"
+            ready={!!data.answerKey?.exists}
+          />
+        </div>
+      </section>
+
+      <section className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-4">
+          <div className="font-bold text-slate-900 text-lg">Source PDF</div>
+
+          {data.sourcePdf?.exists ? (
+            <div className="space-y-3">
+              <InfoRow
+                label="Filename"
+                value={data.sourcePdf.original_filename ?? '-'}
+              />
+              <InfoRow
+                label="MIME Type"
+                value={data.sourcePdf.mime_type ?? '-'}
+              />
+              <InfoRow
+                label="Size"
+                value={formatBytes(data.sourcePdf.file_size_bytes)}
+              />
+              <InfoRow
+                label="Uploaded At"
+                value={formatDateTime(data.sourcePdf.uploaded_at)}
+              />
+
+              <div className="flex flex-wrap gap-3 pt-2">
+                <a
+                  href={`/api/instructor/assignments/${assignmentId}/source-pdf/url?mode=preview`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="px-4 py-2 rounded-lg bg-slate-900 text-white font-semibold hover:bg-slate-800"
+                >
+                  Preview PDF
+                </a>
+
+                <a
+                  href={`/api/instructor/assignments/${assignmentId}/source-pdf/url?mode=download`}
+                  className="px-4 py-2 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700"
+                >
+                  Download PDF
+                </a>
+
+                <button
+                  type="button"
+                  onClick={handleRemoveSourcePdf}
+                  disabled={removing}
+                  className="px-4 py-2 rounded-lg bg-red-600 text-white font-semibold hover:bg-red-700 disabled:bg-red-300"
+                >
+                  {removing ? 'กำลังลบ...' : 'Remove PDF'}
+                </button>
+              </div>
+            </div>
+          ) : (
             <div className="space-y-4">
-              {data.sourcePdf?.exists ? (
-                <>
-                  <div className="space-y-2 text-sm text-slate-600">
-                    <div>
-                      Filename:{' '}
-                      <span className="font-semibold text-slate-900">
-                        {data.sourcePdf.original_filename}
-                      </span>
-                    </div>
-                    <div>
-                      Size:{' '}
-                      <span className="font-semibold text-slate-900">
-                        {formatFileSize(data.sourcePdf.file_size_bytes)}
-                      </span>
-                    </div>
-                    <div>
-                      Uploaded At:{' '}
-                      <span className="font-semibold text-slate-900">
-                        {formatDateTime(data.sourcePdf.uploaded_at)}
-                      </span>
-                    </div>
-                  </div>
+              <div className="text-slate-500">ยังไม่มี source PDF</div>
 
-                  <div className="flex flex-wrap gap-3">
-                    <Link
-                      href={`/instructor/assignments/${assignmentId}/source-pdf`}
-                      className="px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-semibold hover:bg-slate-800"
-                    >
-                      Preview PDF
-                    </Link>
+              <input
+                type="file"
+                accept="application/pdf"
+                onChange={(e) => setSelectedFile(e.target.files?.[0] ?? null)}
+                className="block w-full text-sm"
+              />
 
-                    <a
-                      href={`/api/instructor/assignments/${assignmentId}/source-pdf/url?mode=download`}
-                      className="px-3 py-2 rounded-lg bg-emerald-600 text-white text-sm font-semibold hover:bg-emerald-700"
-                    >
-                      Download PDF
-                    </a>
-
-                    <label className="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 cursor-pointer">
-                      {uploading ? 'กำลังแทนที่...' : 'Replace PDF'}
-                      <input
-                        type="file"
-                        accept="application/pdf"
-                        className="hidden"
-                        disabled={uploading}
-                        onChange={(e) => {
-                          const file = e.target.files?.[0]
-                          if (file) onUploadFile(file)
-                          e.currentTarget.value = ''
-                        }}
-                      />
-                    </label>
-
-                    <button
-                      type="button"
-                      disabled={removing}
-                      onClick={removePdf}
-                      className="px-3 py-2 rounded-lg bg-red-600 text-white text-sm font-semibold hover:bg-red-700 disabled:bg-red-300"
-                    >
-                      {removing ? 'กำลังลบ...' : 'Remove PDF'}
-                    </button>
-                  </div>
-                </>
-              ) : (
-                <div className="space-y-4">
-                  <div className="text-sm text-slate-600">
-                    ยังไม่มีไฟล์ PDF ต้นฉบับของ assignment นี้
-                  </div>
-
-                  <label className="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-blue-600 text-white text-sm font-semibold hover:bg-blue-700 cursor-pointer">
-                    {uploading ? 'กำลังอัปโหลด...' : 'Upload PDF'}
-                    <input
-                      type="file"
-                      accept="application/pdf"
-                      className="hidden"
-                      disabled={uploading}
-                      onChange={(e) => {
-                        const file = e.target.files?.[0]
-                        if (file) onUploadFile(file)
-                        e.currentTarget.value = ''
-                      }}
-                    />
-                  </label>
-                </div>
-              )}
-            </div>
-          </WorkspaceCard>
-
-          <WorkspaceCard
-            title="Layout Spec"
-            status={
-              data.layoutSpec
-                ? `${data.layoutSpec.layout_status} • v${data.layoutSpec.version}`
-                : 'not_created'
-            }
-            actions={
-              <Link
-                href={`/instructor/assignments/${data.assignment.id}/layout`}
-                className="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-semibold hover:bg-slate-800"
+              <button
+                type="button"
+                onClick={handleUploadSourcePdf}
+                disabled={uploading || !selectedFile}
+                className="px-4 py-2 rounded-lg bg-emerald-600 text-white font-semibold hover:bg-emerald-700 disabled:bg-emerald-300"
               >
-                จัดการ Layout
-              </Link>
-            }
-          >
-            <div className="space-y-2 text-sm text-slate-600">
-              <div>Spec Name: {data.layoutSpec?.spec_name ?? '-'}</div>
-              <div>Page Count: {data.layoutSpec?.page_count ?? '-'}</div>
-              <div>Schema Version: {data.layoutSpec?.schema_version ?? '-'}</div>
-              <div>Approved At: {formatDateTime(data.layoutSpec?.approved_at)}</div>
+                {uploading ? 'กำลังอัปโหลด...' : 'Upload Source PDF'}
+              </button>
             </div>
-          </WorkspaceCard>
-
-          <WorkspaceCard
-            title="Answer Key"
-            status={data.answerKey?.approval_status ?? 'draft'}
-            actions={
-              <Link
-                href={`/instructor/assignments/${assignmentId}/answer-key`}
-                className="inline-flex items-center justify-center px-3 py-2 rounded-lg bg-slate-900 text-white text-sm font-semibold hover:bg-slate-800"
-              >
-                Edit JSON
-              </Link>
-            }
-          >
-            <div className="space-y-3 text-sm text-slate-600">
-              <div>Exists: {data.answerKey?.exists ? 'YES' : 'NO'}</div>
-              <div>Items: {data.answerKey?.item_count ?? 0}</div>
-              <div>
-                Generation Status: {data.answerKey?.generation_status ?? 'not_started'}
-              </div>
-              <div>
-                Generated by AI: {data.answerKey?.generated_by_ai ? 'YES' : 'NO'}
-              </div>
-              <div>AI Model: {data.answerKey?.ai_model ?? '-'}</div>
-              <div>Approval Status: {data.answerKey?.approval_status ?? '-'}</div>
-              <div>Approved At: {formatDateTime(data.answerKey?.approved_at)}</div>
-              <div>Updated At: {formatDateTime(data.answerKey?.updated_at)}</div>
-              <div>Notes: {data.answerKey?.generation_notes ?? '-'}</div>
-
-              <div className="pt-2 flex flex-wrap gap-3">
-                <button
-                  type="button"
-                  disabled={!canGenerate || generating}
-                  onClick={generateAnswerKey}
-                  className="px-3 py-2 rounded-lg bg-purple-600 text-white text-sm font-semibold hover:bg-purple-700 disabled:bg-purple-300"
-                >
-                  {generating ? 'กำลังสร้าง...' : 'Generate AI Answer Key'}
-                </button>
-
-                <button
-                  type="button"
-                  disabled={!data.answerKey?.exists || approving}
-                  onClick={approveAnswerKey}
-                  className="px-3 py-2 rounded-lg bg-emerald-600 text-white text-sm font-semibold hover:bg-emerald-700 disabled:bg-emerald-300"
-                >
-                  {approving ? 'กำลังอนุมัติ...' : 'Approve'}
-                </button>
-
-                <button
-                  type="button"
-                  disabled={!data.answerKey?.exists || rejecting}
-                  onClick={rejectAnswerKey}
-                  className="px-3 py-2 rounded-lg bg-amber-600 text-white text-sm font-semibold hover:bg-amber-700 disabled:bg-amber-300"
-                >
-                  {rejecting ? 'กำลัง reject...' : 'Reject'}
-                </button>
-              </div>
-            </div>
-          </WorkspaceCard>
-
-          <WorkspaceCard title="Publishing / Workflow" status="mvp">
-            <div className="space-y-2 text-sm text-slate-600">
-              <div>Upload PDF: {data.sourcePdf?.exists ? 'ready' : 'pending'}</div>
-              <div>Layout Spec: {data.layoutSpec ? 'ready' : 'pending'}</div>
-              <div>
-                Generate AI answer key:{' '}
-                {data.answerKey?.exists ? 'ready' : 'pending'}
-              </div>
-              <div>
-                Approve answer key:{' '}
-                {data.answerKey?.approval_status === 'approved'
-                  ? 'ready'
-                  : 'pending'}
-              </div>
-              <div>Publish for grading: planned</div>
-            </div>
-          </WorkspaceCard>
+          )}
         </div>
+
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-4">
+          <div className="font-bold text-slate-900 text-lg">Layout Spec</div>
+
+          {data.layoutSpec ? (
+            <div className="space-y-3">
+              <InfoRow label="Spec Name" value={data.layoutSpec.spec_name ?? '-'} />
+              <InfoRow label="Version" value={String(data.layoutSpec.version ?? '-')} />
+              <InfoRow
+                label="Schema Version"
+                value={String(data.layoutSpec.schema_version ?? '-')}
+              />
+              <InfoRow
+                label="Page Count"
+                value={String(data.layoutSpec.page_count ?? '-')}
+              />
+              <InfoRow
+                label="Layout Status"
+                value={data.layoutSpec.layout_status ?? '-'}
+              />
+              <InfoRow
+                label="Approved At"
+                value={formatDateTime(data.layoutSpec.approved_at)}
+              />
+              <InfoRow
+                label="Created At"
+                value={formatDateTime(data.layoutSpec.created_at)}
+              />
+
+              <div className="flex flex-wrap gap-3 pt-2">
+                <Link
+                  href={`/instructor/assignments/${assignmentId}/layout`}
+                  className="px-4 py-2 rounded-lg bg-violet-600 text-white font-semibold hover:bg-violet-700"
+                >
+                  Manage Layout
+                </Link>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <div className="text-slate-500">ยังไม่มี layout spec</div>
+              <Link
+                href={`/instructor/assignments/${assignmentId}/layout`}
+                className="inline-flex px-4 py-2 rounded-lg bg-violet-600 text-white font-semibold hover:bg-violet-700"
+              >
+                Create Layout
+              </Link>
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-4">
+          <div className="font-bold text-slate-900 text-lg">Answer Key</div>
+
+          {data.answerKey?.exists ? (
+            <div className="space-y-3">
+              <InfoRow
+                label="Generation Status"
+                value={data.answerKey.generation_status ?? '-'}
+              />
+              <InfoRow
+                label="Approval Status"
+                value={data.answerKey.approval_status ?? '-'}
+              />
+              <InfoRow
+                label="Generated by AI"
+                value={data.answerKey.generated_by_ai ? 'TRUE' : 'FALSE'}
+              />
+              <InfoRow label="AI Model" value={data.answerKey.ai_model ?? '-'} />
+              <InfoRow
+                label="Item Count"
+                value={String(data.answerKey.item_count ?? 0)}
+              />
+              <InfoRow
+                label="Updated At"
+                value={formatDateTime(data.answerKey.updated_at)}
+              />
+              <InfoRow
+                label="Approved At"
+                value={formatDateTime(data.answerKey.approved_at)}
+              />
+              <InfoRow
+                label="Generation Notes"
+                value={data.answerKey.generation_notes ?? '-'}
+              />
+              <InfoRow
+                label="Last Error"
+                value={data.answerKey.last_generation_error ?? '-'}
+              />
+
+              <div className="flex flex-wrap gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={approveAnswerKey}
+                  disabled={approving || !canApproveAnswerKey}
+                  className="px-4 py-2 rounded-lg bg-emerald-600 text-white font-semibold hover:bg-emerald-700 disabled:bg-emerald-300"
+                >
+                  {approving ? 'กำลังอนุมัติ...' : 'Approve Answer Key'}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={rejectAnswerKey}
+                  disabled={rejecting || !canRejectAnswerKey}
+                  className="px-4 py-2 rounded-lg bg-amber-600 text-white font-semibold hover:bg-amber-700 disabled:bg-amber-300"
+                >
+                  {rejecting ? 'กำลังส่งกลับ...' : 'Reject Answer Key'}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="text-slate-500">ยังไม่มี answer key</div>
+          )}
+        </div>
+
+        <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 space-y-4">
+          <div className="font-bold text-slate-900 text-lg">Publishing / Workflow</div>
+
+          <div className="space-y-3">
+            <InfoRow
+              label="Source PDF Ready"
+              value={sourceReady ? 'READY' : 'NOT READY'}
+            />
+            <InfoRow
+              label="Layout Ready"
+              value={layoutReady ? 'READY' : 'NOT READY'}
+            />
+            <InfoRow
+              label="Approved Layout Ready"
+              value={approvedLayoutReady ? 'READY' : 'NOT READY'}
+            />
+            <InfoRow
+              label="Answer Key Exists"
+              value={data.answerKey?.exists ? 'READY' : 'NOT READY'}
+            />
+          </div>
+
+          <div className="flex flex-wrap gap-3 pt-2">
+            <button
+              type="button"
+              onClick={generateAnswerKey}
+              disabled={generating || !canGenerate}
+              className="px-4 py-2 rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-700 disabled:bg-indigo-300"
+            >
+              {generating ? 'กำลังสร้าง...' : 'Generate Answer Key'}
+            </button>
+
+            <Link
+              href={`/instructor/assignments/${assignmentId}/submissions`}
+              className="px-4 py-2 rounded-lg bg-slate-900 text-white font-semibold hover:bg-slate-800"
+            >
+              Open Submissions
+            </Link>
+          </div>
+
+          {!canGenerate && (
+            <div className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-3">
+              ต้องมี source PDF และ layout spec ก่อน จึงจะสร้าง answer key ได้
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
+        <div className="font-bold text-slate-900 text-lg mb-4">Layout Versions</div>
+
+        {data.layoutVersions && data.layoutVersions.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="border-b border-slate-200 text-slate-500">
+                <tr>
+                  <th className="text-left py-3 pr-4 font-medium">Version</th>
+                  <th className="text-left py-3 pr-4 font-medium">Name</th>
+                  <th className="text-left py-3 pr-4 font-medium">Status</th>
+                  <th className="text-left py-3 pr-4 font-medium">Active</th>
+                  <th className="text-left py-3 pr-4 font-medium">Created At</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {data.layoutVersions.map((row) => (
+                  <tr key={row.id}>
+                    <td className="py-3 pr-4">{row.version ?? '-'}</td>
+                    <td className="py-3 pr-4">{row.spec_name ?? '-'}</td>
+                    <td className="py-3 pr-4">{row.layout_status ?? '-'}</td>
+                    <td className="py-3 pr-4">{row.is_active ? 'TRUE' : 'FALSE'}</td>
+                    <td className="py-3 pr-4">{formatDateTime(row.created_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="text-slate-500">ยังไม่มี layout versions</div>
+        )}
       </section>
     </div>
   )
 }
 
-function StatCard({
-  title,
-  value,
-  valueClassName = 'text-slate-900',
-}: {
-  title: string
-  value: string
-  valueClassName?: string
-}) {
+function InfoCard({ title, value }: { title: string; value: string }) {
   return (
     <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-sm">
       <div className="text-sm text-slate-500 font-medium">{title}</div>
-      <div className={`text-3xl font-extrabold mt-2 ${valueClassName}`}>
+      <div className="text-xl font-extrabold text-slate-900 mt-2">{value}</div>
+    </div>
+  )
+}
+
+function InfoRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-start justify-between gap-4 rounded-lg border border-slate-100 p-3">
+      <div className="text-slate-500 font-medium">{label}</div>
+      <div className="text-slate-900 font-semibold text-right whitespace-pre-wrap">
         {value}
       </div>
     </div>
   )
 }
 
-function WorkspaceCard({
-  title,
-  status,
-  actions,
-  children,
-}: {
-  title: string
-  status: string
-  actions?: React.ReactNode
-  children: React.ReactNode
-}) {
+function ReadinessRow({ label, ready }: { label: string; ready: boolean }) {
   return (
-    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5">
-      <div className="flex items-start justify-between gap-3 mb-4">
-        <div>
-          <div className="font-bold text-slate-900">{title}</div>
-          <div className="text-sm text-slate-500 mt-1">Status: {status}</div>
-        </div>
-        {actions}
-      </div>
-      {children}
-    </div>
-  )
-}
-
-function Row({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex items-start justify-between gap-4 rounded-lg border border-slate-100 p-3">
+    <div className="flex items-center justify-between rounded-lg border border-slate-100 p-3">
       <div className="text-slate-500 font-medium">{label}</div>
-      <div className="text-slate-900 font-semibold text-right">{value}</div>
+      <div
+        className={`font-bold ${
+          ready ? 'text-emerald-600' : 'text-amber-600'
+        }`}
+      >
+        {ready ? 'READY' : 'NOT READY'}
+      </div>
     </div>
   )
 }
@@ -581,8 +774,8 @@ function formatDateTime(value?: string | null) {
   }
 }
 
-function formatFileSize(value?: number | null) {
-  if (!value || value <= 0) return '-'
+function formatBytes(value?: number | null) {
+  if (value == null) return '-'
   if (value < 1024) return `${value} B`
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
   return `${(value / (1024 * 1024)).toFixed(2)} MB`

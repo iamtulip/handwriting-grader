@@ -1,5 +1,6 @@
 'use client'
 
+import Link from 'next/link'
 import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 
@@ -10,87 +11,94 @@ type SectionItem = {
   term: string
 }
 
-export default function NewInstructorAssignmentPage() {
+type FormState = {
+  section_id: string
+  title: string
+  description: string
+  assignment_type: string
+  week_number: string
+  class_date: string
+  open_at: string
+  due_at: string
+  close_at: string
+  end_of_friday_at: string
+}
+
+export default function NewAssignmentPage() {
   const router = useRouter()
 
-  const [sections, setSections] = useState<SectionItem[]>([])
   const [loadingSections, setLoadingSections] = useState(true)
-
-  const [sectionId, setSectionId] = useState('')
-  const [title, setTitle] = useState('')
-  const [assignmentType, setAssignmentType] = useState<'weekly_exercise' | 'quiz' | 'midterm' | 'final'>('weekly_exercise')
-  const [weekNumber, setWeekNumber] = useState('')
-  const [classDate, setClassDate] = useState('')
-  const [openAt, setOpenAt] = useState('')
-  const [dueAt, setDueAt] = useState('')
-  const [closeAt, setCloseAt] = useState('')
-  const [endOfFridayAt, setEndOfFridayAt] = useState('')
-  const [description, setDescription] = useState('')
-
   const [saving, setSaving] = useState(false)
   const [status, setStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [sections, setSections] = useState<SectionItem[]>([])
+
+  const [form, setForm] = useState<FormState>({
+    section_id: '',
+    title: '',
+    description: '',
+    assignment_type: 'weekly_exercise',
+    week_number: '',
+    class_date: '',
+    open_at: '',
+    due_at: '',
+    close_at: '',
+    end_of_friday_at: '',
+  })
 
   useEffect(() => {
     const run = async () => {
       try {
         const res = await fetch('/api/instructor/sections', {
           cache: 'no-store',
-          headers: {
-            Accept: 'application/json',
-          },
+          headers: { Accept: 'application/json' },
         })
-
         const data = await res.json()
         if (!res.ok) throw new Error(data.error || 'Failed to load sections')
 
-        setSections(data.items ?? [])
+        const items = data.items ?? []
+        setSections(items)
+        if (items.length > 0) {
+          setForm((prev) => ({ ...prev, section_id: items[0].id }))
+        }
       } catch (e: any) {
-        setStatus({
-          type: 'error',
-          text: e.message || 'โหลด sections ไม่สำเร็จ',
-        })
+        setStatus({ type: 'error', text: e.message || 'โหลด sections ไม่สำเร็จ' })
       } finally {
         setLoadingSections(false)
       }
     }
-
     run()
   }, [])
 
-  const isWeekly = useMemo(() => assignmentType === 'weekly_exercise', [assignmentType])
+  function setField<K extends keyof FormState>(key: K, value: FormState[K]) {
+    setForm((prev) => ({ ...prev, [key]: value }))
+  }
 
-  const canSubmit = useMemo(() => {
-    return !saving && sectionId.trim().length > 0 && title.trim().length > 0
-  }, [saving, sectionId, title])
+  const canSave = useMemo(() => {
+    return (
+      !saving &&
+      form.section_id.trim().length > 0 &&
+      form.title.trim().length > 0
+    )
+  }, [form, saving])
 
-  const submit = async (e: React.FormEvent) => {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
+    setSaving(true)
     setStatus(null)
 
-    if (!sectionId.trim()) {
-      setStatus({ type: 'error', text: 'กรุณาเลือก Section' })
-      return
-    }
-
-    if (!title.trim()) {
-      setStatus({ type: 'error', text: 'กรุณากรอกชื่องาน' })
-      return
-    }
-
-    setSaving(true)
-
     try {
-      const payload = {
-        section_id: sectionId,
-        title: title.trim(),
-        assignment_type: assignmentType,
-        week_number: weekNumber ? Number(weekNumber) : null,
-        class_date: classDate || null,
-        open_at: openAt ? new Date(openAt).toISOString() : null,
-        due_at: dueAt ? new Date(dueAt).toISOString() : null,
-        close_at: closeAt ? new Date(closeAt).toISOString() : null,
-        end_of_friday_at: endOfFridayAt ? new Date(endOfFridayAt).toISOString() : null,
-        description: description.trim() || null,
+      const body = {
+        section_id: form.section_id,
+        title: form.title.trim(),
+        description: form.description.trim() || null,
+        assignment_type: form.assignment_type,
+        week_number:
+          form.week_number.trim() === '' ? null : Number(form.week_number),
+        class_date: form.class_date || null,
+        open_at: form.open_at || null,
+        due_at: form.due_at || null,
+        close_at: form.close_at || null,
+        end_of_friday_at: form.end_of_friday_at || null,
       }
 
       const res = await fetch('/api/instructor/assignments/create', {
@@ -99,47 +107,34 @@ export default function NewInstructorAssignmentPage() {
           'Content-Type': 'application/json',
           Accept: 'application/json',
         },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(body),
       })
 
       const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'สร้าง assignment ไม่สำเร็จ')
+      if (!res.ok) throw new Error(data.error || 'Create failed')
 
-      setStatus({
-        type: 'success',
-        text: 'สร้าง assignment สำเร็จ',
-      })
-
-      setTimeout(() => {
-        router.push('/instructor/assignments')
-      }, 700)
+      router.push(`/instructor/assignments/${data.item.id}`)
     } catch (e: any) {
-      setStatus({
-        type: 'error',
-        text: e.message || 'เกิดข้อผิดพลาดในการสร้าง assignment',
-      })
+      setStatus({ type: 'error', text: e.message || 'สร้าง assignment ไม่สำเร็จ' })
     } finally {
       setSaving(false)
     }
   }
 
   return (
-    <div className="space-y-6 max-w-5xl mx-auto">
-      <header className="flex items-start justify-between gap-4">
+    <div className="space-y-8 max-w-5xl mx-auto">
+      <header className="flex items-start justify-between gap-6 border-b border-slate-200 pb-6">
         <div>
-          <h1 className="text-3xl font-extrabold text-slate-900">สร้าง Assignment</h1>
-          <p className="text-slate-600 mt-2 text-lg">
-            สร้างงานใหม่สำหรับ section ที่คุณรับผิดชอบ
-          </p>
+          <h1 className="text-3xl font-extrabold text-slate-900">Create Assignment</h1>
+          <p className="text-slate-600 mt-2 text-lg">สร้างงานใหม่สำหรับ section ที่คุณดูแล</p>
         </div>
 
-        <button
-          type="button"
-          onClick={() => router.push('/instructor/assignments')}
-          className="px-4 py-2 rounded-lg bg-slate-100 text-slate-700 font-semibold hover:bg-slate-200 transition-colors"
+        <Link
+          href="/instructor/assignments"
+          className="px-4 py-2 rounded-lg bg-slate-100 text-slate-700 font-semibold hover:bg-slate-200"
         >
-          ย้อนกลับ
-        </button>
+          กลับรายการงาน
+        </Link>
       </header>
 
       {status && (
@@ -154,31 +149,30 @@ export default function NewInstructorAssignmentPage() {
         </div>
       )}
 
-      <form onSubmit={submit} className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-6">
-        <section className="grid grid-cols-1 md:grid-cols-2 gap-5">
-          <div>
-            <label className="block text-sm font-bold text-slate-700 mb-2">Section *</label>
+      <form
+        onSubmit={handleSubmit}
+        className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 space-y-6"
+      >
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+          <Field label="Section">
             <select
-              value={sectionId}
-              onChange={(e) => setSectionId(e.target.value)}
-              disabled={loadingSections}
+              value={form.section_id}
+              onChange={(e) => setField('section_id', e.target.value)}
               className="w-full rounded-lg border border-slate-300 px-4 py-3 bg-white"
-              required
+              disabled={loadingSections}
             >
-              <option value="">-- เลือก section --</option>
               {sections.map((s) => (
                 <option key={s.id} value={s.id}>
                   {s.course_code} - Sec {s.section_number} ({s.term})
                 </option>
               ))}
             </select>
-          </div>
+          </Field>
 
-          <div>
-            <label className="block text-sm font-bold text-slate-700 mb-2">ประเภทงาน *</label>
+          <Field label="Type">
             <select
-              value={assignmentType}
-              onChange={(e) => setAssignmentType(e.target.value as any)}
+              value={form.assignment_type}
+              onChange={(e) => setField('assignment_type', e.target.value)}
               className="w-full rounded-lg border border-slate-300 px-4 py-3 bg-white"
             >
               <option value="weekly_exercise">weekly_exercise</option>
@@ -186,112 +180,107 @@ export default function NewInstructorAssignmentPage() {
               <option value="midterm">midterm</option>
               <option value="final">final</option>
             </select>
-          </div>
+          </Field>
 
-          <div className="md:col-span-2">
-            <label className="block text-sm font-bold text-slate-700 mb-2">ชื่องาน *</label>
+          <Field label="Title">
             <input
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
+              value={form.title}
+              onChange={(e) => setField('title', e.target.value)}
               className="w-full rounded-lg border border-slate-300 px-4 py-3"
-              placeholder="เช่น Worksheet 1: Derivatives"
-              required
+              placeholder="ชื่องาน"
             />
-          </div>
+          </Field>
 
-          <div>
-            <label className="block text-sm font-bold text-slate-700 mb-2">สัปดาห์ที่</label>
+          <Field label="Week Number">
             <input
               type="number"
-              value={weekNumber}
-              onChange={(e) => setWeekNumber(e.target.value)}
+              value={form.week_number}
+              onChange={(e) => setField('week_number', e.target.value)}
               className="w-full rounded-lg border border-slate-300 px-4 py-3"
-              placeholder="เช่น 3"
+              placeholder="เช่น 6"
             />
-          </div>
+          </Field>
 
-          <div>
-            <label className="block text-sm font-bold text-slate-700 mb-2">วันที่เรียน</label>
+          <Field label="Class Date">
             <input
               type="date"
-              value={classDate}
-              onChange={(e) => setClassDate(e.target.value)}
+              value={form.class_date}
+              onChange={(e) => setField('class_date', e.target.value)}
               className="w-full rounded-lg border border-slate-300 px-4 py-3"
             />
-          </div>
+          </Field>
 
-          <div>
-            <label className="block text-sm font-bold text-slate-700 mb-2">เปิดรับงาน</label>
+          <Field label="Open At">
             <input
               type="datetime-local"
-              value={openAt}
-              onChange={(e) => setOpenAt(e.target.value)}
+              value={form.open_at}
+              onChange={(e) => setField('open_at', e.target.value)}
               className="w-full rounded-lg border border-slate-300 px-4 py-3"
             />
-          </div>
+          </Field>
 
-          <div>
-            <label className="block text-sm font-bold text-slate-700 mb-2">กำหนดส่ง</label>
+          <Field label="Due At">
             <input
               type="datetime-local"
-              value={dueAt}
-              onChange={(e) => setDueAt(e.target.value)}
+              value={form.due_at}
+              onChange={(e) => setField('due_at', e.target.value)}
               className="w-full rounded-lg border border-slate-300 px-4 py-3"
             />
-          </div>
+          </Field>
 
-          <div>
-            <label className="block text-sm font-bold text-slate-700 mb-2">ปิดรับงาน</label>
+          <Field label="Close At">
             <input
               type="datetime-local"
-              value={closeAt}
-              onChange={(e) => setCloseAt(e.target.value)}
+              value={form.close_at}
+              onChange={(e) => setField('close_at', e.target.value)}
               className="w-full rounded-lg border border-slate-300 px-4 py-3"
             />
-          </div>
+          </Field>
 
-          <div>
-            <label className="block text-sm font-bold text-slate-700 mb-2">
-              ปิดรับวันศุกร์
-            </label>
+          <Field label="End of Friday At">
             <input
               type="datetime-local"
-              value={endOfFridayAt}
-              onChange={(e) => setEndOfFridayAt(e.target.value)}
-              disabled={!isWeekly}
-              className="w-full rounded-lg border border-slate-300 px-4 py-3 disabled:bg-slate-100"
+              value={form.end_of_friday_at}
+              onChange={(e) => setField('end_of_friday_at', e.target.value)}
+              className="w-full rounded-lg border border-slate-300 px-4 py-3"
             />
-          </div>
+          </Field>
+        </div>
 
-          <div className="md:col-span-2">
-            <label className="block text-sm font-bold text-slate-700 mb-2">คำอธิบาย</label>
-            <textarea
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              className="w-full min-h-[140px] rounded-lg border border-slate-300 px-4 py-3"
-              placeholder="รายละเอียดงาน ข้อกำหนด หรือคำชี้แจงเพิ่มเติม"
-            />
-          </div>
-        </section>
+        <Field label="Description">
+          <textarea
+            value={form.description}
+            onChange={(e) => setField('description', e.target.value)}
+            className="w-full min-h-[140px] rounded-lg border border-slate-300 px-4 py-3"
+            placeholder="คำอธิบายงาน"
+          />
+        </Field>
 
-        <div className="pt-2 flex items-center justify-end gap-3">
-          <button
-            type="button"
-            onClick={() => router.push('/instructor/assignments')}
-            className="px-5 py-3 rounded-lg border border-slate-300 text-slate-700 font-semibold hover:bg-slate-50"
-          >
-            ยกเลิก
-          </button>
-
+        <div className="flex justify-end border-t border-slate-200 pt-6">
           <button
             type="submit"
-            disabled={!canSubmit}
-            className="px-5 py-3 rounded-lg bg-blue-600 text-white font-bold hover:bg-blue-700 disabled:bg-blue-300"
+            disabled={!canSave}
+            className="px-5 py-2.5 rounded-lg bg-blue-600 text-white font-bold hover:bg-blue-700 disabled:bg-blue-300"
           >
-            {saving ? 'กำลังบันทึก...' : 'สร้าง Assignment'}
+            {saving ? 'กำลังสร้าง...' : 'Create Assignment'}
           </button>
         </div>
       </form>
     </div>
+  )
+}
+
+function Field({
+  label,
+  children,
+}: {
+  label: string
+  children: React.ReactNode
+}) {
+  return (
+    <label className="block space-y-2">
+      <div className="text-sm font-bold text-slate-700">{label}</div>
+      {children}
+    </label>
   )
 }
