@@ -28,10 +28,16 @@ type AssignmentItem = {
   is_archived?: boolean
 }
 
+type StatusMessage = {
+  type: 'success' | 'error'
+  text: string
+}
+
 export default function InstructorAssignmentsPage() {
   const [loading, setLoading] = useState(true)
   const [items, setItems] = useState<AssignmentItem[]>([])
-  const [status, setStatus] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [status, setStatus] = useState<StatusMessage | null>(null)
+  const [actingId, setActingId] = useState<string | null>(null)
 
   const [sectionFilter, setSectionFilter] = useState<string>('all')
   const [typeFilter, setTypeFilter] = useState<string>('all')
@@ -64,6 +70,7 @@ export default function InstructorAssignmentsPage() {
   useEffect(() => {
     const run = async () => {
       try {
+        setStatus(null)
         await loadData()
       } catch (e: any) {
         setStatus({ type: 'error', text: e.message || 'โหลด assignments ไม่สำเร็จ' })
@@ -128,6 +135,79 @@ export default function InstructorAssignmentsPage() {
           : 0,
     }
   }, [filteredItems])
+
+  async function handleDelete(item: AssignmentItem) {
+    const confirmed = window.confirm(
+      `คุณแน่ใจหรือไม่ว่าต้องการลบ assignment นี้?\n\n${item.title}\n\nถ้ามี submissions แล้ว ระบบจะไม่อนุญาตให้ลบ`
+    )
+    if (!confirmed) return
+
+    setActingId(item.id)
+    setStatus(null)
+
+    try {
+      const res = await fetch(`/api/instructor/assignments/${item.id}/manage`, {
+        method: 'DELETE',
+        headers: { Accept: 'application/json' },
+      })
+
+      const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data.error || 'Delete failed')
+      }
+
+      setStatus({ type: 'success', text: `ลบ assignment "${item.title}" สำเร็จ` })
+      await loadData()
+    } catch (e: any) {
+      setStatus({ type: 'error', text: e.message || 'ลบ assignment ไม่สำเร็จ' })
+    } finally {
+      setActingId(null)
+    }
+  }
+
+  async function handleArchiveToggle(item: AssignmentItem) {
+    const isArchived = !!item.is_archived
+    const confirmed = window.confirm(
+      isArchived
+        ? `ต้องการนำ assignment นี้กลับมาใช้งานหรือไม่?\n\n${item.title}`
+        : `ต้องการ archive assignment นี้หรือไม่?\n\n${item.title}`
+    )
+    if (!confirmed) return
+
+    setActingId(item.id)
+    setStatus(null)
+
+    try {
+      const res = await fetch(`/api/instructor/assignments/${item.id}/manage`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({
+          action: isArchived ? 'unarchive' : 'archive',
+        }),
+      })
+
+      const data = await res.json()
+      if (!res.ok) {
+        throw new Error(data.error || 'Archive action failed')
+      }
+
+      setStatus({
+        type: 'success',
+        text: isArchived
+          ? `นำ assignment "${item.title}" กลับมาใช้งานแล้ว`
+          : `archive assignment "${item.title}" สำเร็จ`,
+      })
+
+      await loadData()
+    } catch (e: any) {
+      setStatus({ type: 'error', text: e.message || 'เปลี่ยนสถานะ assignment ไม่สำเร็จ' })
+    } finally {
+      setActingId(null)
+    }
+  }
 
   if (loading) {
     return <div className="p-8">กำลังโหลด assignments...</div>
@@ -273,69 +353,115 @@ export default function InstructorAssignmentsPage() {
             </thead>
 
             <tbody className="divide-y divide-slate-100">
-              {filteredItems.map((item) => (
-                <tr key={item.id} className="hover:bg-slate-50 transition-colors">
-                  <td className="p-4">
-                    <div className="font-bold text-slate-900">{item.title}</div>
-                    <div className="text-xs text-slate-500 mt-1">{item.id}</div>
-                  </td>
+              {filteredItems.map((item) => {
+                const isBusy = actingId === item.id
+                const hasSubmissions = Number(item.submission_count ?? 0) > 0
 
-                  <td className="p-4 text-slate-600">
-                    {item.course_code && item.section_number != null
-                      ? `${item.course_code} - Sec ${item.section_number}${item.term ? ` (${item.term})` : ''}`
-                      : '-'}
-                  </td>
+                return (
+                  <tr key={item.id} className="hover:bg-slate-50 transition-colors">
+                    <td className="p-4">
+                      <div className="font-bold text-slate-900 flex items-center gap-2 flex-wrap">
+                        <span>{item.title}</span>
+                        {item.is_archived && (
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-100 text-amber-700 border border-amber-200">
+                            ARCHIVED
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-xs text-slate-500 mt-1">{item.id}</div>
+                    </td>
 
-                  <td className="p-4 text-slate-600">{item.assignment_type ?? '-'}</td>
-                  <td className="p-4 text-slate-600">{item.week_number ?? '-'}</td>
-                  <td className="p-4 text-slate-600">{item.class_date ?? '-'}</td>
-                  <td className="p-4 text-slate-600">{formatDateTime(item.due_at)}</td>
+                    <td className="p-4 text-slate-600">
+                      {item.course_code && item.section_number != null
+                        ? `${item.course_code} - Sec ${item.section_number}${item.term ? ` (${item.term})` : ''}`
+                        : '-'}
+                    </td>
 
-                  <td className="p-4 text-right font-semibold text-slate-900">
-                    {item.submission_count ?? 0}
-                  </td>
+                    <td className="p-4 text-slate-600">{item.assignment_type ?? '-'}</td>
+                    <td className="p-4 text-slate-600">{item.week_number ?? '-'}</td>
+                    <td className="p-4 text-slate-600">{item.class_date ?? '-'}</td>
+                    <td className="p-4 text-slate-600">{formatDateTime(item.due_at)}</td>
 
-                  <td className="p-4 text-right font-semibold text-red-600">
-                    {item.needs_review_count ?? 0}
-                  </td>
+                    <td className="p-4 text-right font-semibold text-slate-900">
+                      {item.submission_count ?? 0}
+                    </td>
 
-                  <td className="p-4 text-right font-semibold text-blue-600">
-                    {Number(item.avg_total_score ?? 0).toFixed(2)}
-                  </td>
+                    <td className="p-4 text-right font-semibold text-red-600">
+                      {item.needs_review_count ?? 0}
+                    </td>
 
-                  <td className="p-4">
-                    <div className="flex justify-end gap-2 flex-wrap">
-                      <Link
-                        href={`/instructor/assignments/${item.id}`}
-                        className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800"
-                      >
-                        Workspace
-                      </Link>
+                    <td className="p-4 text-right font-semibold text-blue-600">
+                      {Number(item.avg_total_score ?? 0).toFixed(2)}
+                    </td>
 
-                      <Link
-                        href={`/instructor/assignments/${item.id}/files`}
-                        className="px-3 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700"
-                      >
-                        Files
-                      </Link>
+                    <td className="p-4">
+                      <div className="flex justify-end gap-2 flex-wrap">
+                        <Link
+                          href={`/instructor/assignments/${item.id}`}
+                          className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800"
+                        >
+                          Workspace
+                        </Link>
 
-                      <Link
-                        href={`/instructor/assignments/${item.id}/answer-key`}
-                        className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700"
-                      >
-                        Answer Key
-                      </Link>
+                        <Link
+                          href={`/instructor/assignments/${item.id}/edit`}
+                          className="px-3 py-1.5 rounded-lg bg-amber-600 text-white text-xs font-semibold hover:bg-amber-700"
+                        >
+                          Edit
+                        </Link>
 
-                      <Link
-                        href={`/instructor/assignments/${item.id}/layout`}
-                        className="px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700"
-                      >
-                        Layout
-                      </Link>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                        <Link
+                          href={`/instructor/assignments/${item.id}/files`}
+                          className="px-3 py-1.5 rounded-lg bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700"
+                        >
+                          Files
+                        </Link>
+
+                        <Link
+                          href={`/instructor/assignments/${item.id}/answer-key`}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700"
+                        >
+                          Answer Key
+                        </Link>
+
+                        <Link
+                          href={`/instructor/assignments/${item.id}/layout`}
+                          className="px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700"
+                        >
+                          Layout
+                        </Link>
+
+                        <button
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() => handleArchiveToggle(item)}
+                          className="px-3 py-1.5 rounded-lg bg-slate-200 text-slate-700 text-xs font-semibold hover:bg-slate-300 disabled:opacity-50"
+                        >
+                          {isBusy
+                            ? 'กำลังทำงาน...'
+                            : item.is_archived
+                            ? 'Unarchive'
+                            : 'Archive'}
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() => handleDelete(item)}
+                          className="px-3 py-1.5 rounded-lg bg-red-600 text-white text-xs font-semibold hover:bg-red-700 disabled:bg-red-300"
+                          title={
+                            hasSubmissions
+                              ? 'ถ้ามี submissions แล้ว ระบบจะไม่อนุญาตให้ลบ'
+                              : 'Delete assignment'
+                          }
+                        >
+                          {isBusy ? 'กำลังลบ...' : 'Delete'}
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
 
               {filteredItems.length === 0 && (
                 <tr>

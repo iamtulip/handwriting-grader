@@ -1,5 +1,7 @@
 // apps/web/app/layout.tsx
 import '../styles/globals.css'; // ดึงความสวยงามของ Tailwind มาใช้
+import 'react-pdf/dist/Page/TextLayer.css'
+import 'react-pdf/dist/Page/AnnotationLayer.css'
 import type { Metadata } from 'next';
 
 export const metadata: Metadata = {

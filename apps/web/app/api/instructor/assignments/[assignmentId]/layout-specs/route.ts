@@ -5,7 +5,7 @@ import { requireInstructorAssignmentAccess } from '@/lib/instructor-permissions'
 export const runtime = 'nodejs'
 
 function validateLayoutData(layoutData: any, assignmentId: string) {
-  if (!layoutData || typeof layoutData !== 'object') {
+  if (!layoutData || typeof layoutData !== 'object' || Array.isArray(layoutData)) {
     return 'layout_data is required'
   }
 
@@ -25,39 +25,69 @@ function validateLayoutData(layoutData: any, assignmentId: string) {
     return 'layout_data.pages must be an array'
   }
 
+  const seenRegionIds = new Set<string>()
+
   for (const page of layoutData.pages) {
     if (typeof page.page_number !== 'number') {
       return 'each page must have page_number'
     }
 
     if (!Array.isArray(page.regions)) {
-      return page ${page.page_number} must have regions[]
+      return `page ${page.page_number} must have regions[]`
     }
 
     for (const region of page.regions) {
-      if (!region.id) return page ${page.page_number}: region id is required
-      if (!region.kind) return page ${page.page_number}: region kind is required
+      if (!region.id) {
+        return `page ${page.page_number}: region id is required`
+      }
+
+      if (seenRegionIds.has(region.id)) {
+        return `duplicate region.id: ${region.id}`
+      }
+      seenRegionIds.add(region.id)
+
+      if (!region.kind) {
+        return `page ${page.page_number}: region kind is required`
+      }
 
       const hasBBox = Array.isArray(region.bbox_norm) && region.bbox_norm.length === 4
       const hasPolygon =
         Array.isArray(region.polygon_norm) && region.polygon_norm.length >= 3
 
       if (!hasBBox && !hasPolygon) {
-        return page ${page.page_number}: region ${region.id} must have bbox_norm or polygon_norm
+        return `page ${page.page_number}: region ${region.id} must have bbox_norm or polygon_norm`
       }
 
       if (region.kind === 'answer' && region.question_no == null) {
-        return page ${page.page_number}: answer region ${region.id} must have question_no
+        return `page ${page.page_number}: answer region ${region.id} must have question_no`
+      }
+
+      if (region.kind === 'identity' && !region.identity_type) {
+        return `page ${page.page_number}: identity region ${region.id} must have identity_type`
       }
 
       if (hasBBox) {
-        const [x, y, w, h] = region.bbox_norm
-        const nums = [x, y, w, h]
+        const [x1, y1, x2, y2] = region.bbox_norm
+        const nums = [x1, y1, x2, y2]
+
         if (nums.some((n: number) => typeof n !== 'number' || n < 0 || n > 1)) {
-          return page ${page.page_number}: region ${region.id} bbox_norm must be in [0,1]
+          return `page ${page.page_number}: region ${region.id} bbox_norm values must be in [0,1]`
         }
-        if (w <= 0 || h <= 0) {
-          return page ${page.page_number}: region ${region.id} bbox_norm width/height must be > 0
+
+        if (x2 <= x1 || y2 <= y1) {
+          return `page ${page.page_number}: region ${region.id} bbox_norm must satisfy x2>x1 and y2>y1`
+        }
+      }
+
+      if (hasPolygon) {
+        for (const point of region.polygon_norm) {
+          if (
+            !Array.isArray(point) ||
+            point.length !== 2 ||
+            point.some((n: number) => typeof n !== 'number' || n < 0 || n > 1)
+          ) {
+            return `page ${page.page_number}: region ${region.id} polygon_norm must contain valid normalized points`
+          }
         }
       }
     }
@@ -74,10 +104,17 @@ export async function POST(
 
   const access = await requireInstructorAssignmentAccess(assignmentId)
   if (!access.ok) {
-    return NextResponse.json({ error: access.error }, { status: access.status })
+    return NextResponse.json(
+      { error: access.error ?? 'Forbidden' },
+      { status: access.status }
+    )
   }
 
-  const userId = access.userId!
+  const userId = access.userId
+  if (!userId) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
   const supabase = await createClient()
 
   const body = await req.json()

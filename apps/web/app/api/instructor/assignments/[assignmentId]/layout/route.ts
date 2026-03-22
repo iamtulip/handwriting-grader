@@ -1,128 +1,32 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
+import { requireInstructorAssignmentAccess } from '@/lib/instructor-permissions'
+import { validateLayoutDataV2, normalizeLayoutData } from '@/lib/layout-schema'
 
 export const runtime = 'nodejs'
 
-async function canManageAssignment(
-  supabase: any,
-  userId: string,
-  role: string,
-  assignmentId: string
-) {
-  if (role === 'admin') return true
-
-  const { data: assignment } = await supabase
-    .from('assignments')
-    .select('id, section_id, created_by_user_id, created_by')
-    .eq('id', assignmentId)
-    .maybeSingle()
-
-  if (!assignment) return false
-
-  if (
-    assignment.created_by_user_id === userId ||
-    assignment.created_by === userId
-  ) {
-    return true
-  }
-
-  if (role === 'instructor') {
-    const { data: access } = await supabase
-      .from('instructor_sections')
-      .select('section_id')
-      .eq('instructor_id', userId)
-      .eq('section_id', assignment.section_id)
-      .maybeSingle()
-
-    return !!access
-  }
-
-  if (role === 'reviewer') {
-    const { data: access } = await supabase
-      .from('reviewer_assignments')
-      .select('assignment_id')
-      .eq('reviewer_user_id', userId)
-      .eq('assignment_id', assignmentId)
-      .maybeSingle()
-
-    return !!access
-  }
-
-  return false
+type RouteContext = {
+  params: Promise<{
+    assignmentId: string
+  }>
 }
 
-function defaultLayoutData() {
-  return {
-    schema_version: 2,
-    document_type: 'worksheet',
-    page_count: 1,
-    settings: {
-      allow_multi_roi_per_question: true,
-      enable_identity_verification: true,
-    },
-    pages: [
-      {
-        page_number: 1,
-        rois: [],
-      },
-    ],
-  }
-}
-
-export async function GET(
-  _: Request,
-  context: { params: Promise<{ assignmentId: string }> }
-) {
+export async function GET(_request: NextRequest, context: RouteContext) {
   const { assignmentId } = await context.params
+
+  const access = await requireInstructorAssignmentAccess(assignmentId)
+  if (!access.ok) {
+    return NextResponse.json(
+      { error: access.error ?? 'Forbidden' },
+      { status: access.status }
+    )
+  }
+
   const supabase = await createClient()
 
-  const {
-    data: { user },
-    error: authError,
-  } = await supabase.auth.getUser()
-
-  if (authError || !user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  const { data: me, error: meError } = await supabase
-    .from('user_profiles')
-    .select('role')
-    .eq('id', user.id)
-    .maybeSingle()
-
-  if (meError) {
-    return NextResponse.json({ error: meError.message }, { status: 500 })
-  }
-
-  const role = me?.role ?? 'student'
-  if (!['instructor', 'reviewer', 'admin'].includes(role)) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
-
-  const allowed = await canManageAssignment(supabase, user.id, role, assignmentId)
-  if (!allowed) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
-
-  const { data: specs, error } = await supabase
+  const { data, error } = await supabase
     .from('assignment_layout_specs')
-    .select(`
-      id,
-      assignment_id,
-      version,
-      is_active,
-      layout_data,
-      created_by,
-      created_at,
-      schema_version,
-      spec_name,
-      page_count,
-      layout_status,
-      approved_by,
-      approved_at,
-      notes
-    `)
+    .select('*')
     .eq('assignment_id', assignmentId)
     .order('version', { ascending: false })
 
@@ -130,8 +34,20 @@ export async function GET(
     return NextResponse.json({ error: error.message }, { status: 500 })
   }
 
-  const items = specs ?? []
-  const active = items.find((x) => x.is_active) ?? items[0] ?? null
+  const items = (data ?? []).map((item) => {
+    const { normalized, warnings } = normalizeLayoutData(
+      item.layout_data,
+      Number(item.page_count ?? 1)
+    )
+
+    return {
+      ...item,
+      layout_data: normalized,
+      _normalization_warnings: warnings,
+    }
+  })
+
+  const active = items.find((item) => item.is_active) ?? null
 
   return NextResponse.json({
     items,
@@ -139,53 +55,51 @@ export async function GET(
   })
 }
 
-export async function POST(
-  req: Request,
-  context: { params: Promise<{ assignmentId: string }> }
-) {
+export async function POST(request: NextRequest, context: RouteContext) {
   const { assignmentId } = await context.params
-  const supabase = await createClient()
 
-  const {
-    data: { user },
-    error: authError,
-  } = await supabase.auth.getUser()
+  const access = await requireInstructorAssignmentAccess(assignmentId)
+  if (!access.ok) {
+    return NextResponse.json(
+      { error: access.error ?? 'Forbidden' },
+      { status: access.status }
+    )
+  }
 
-  if (authError || !user) {
+  const userId = access.userId
+  if (!userId) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  const { data: me, error: meError } = await supabase
-    .from('user_profiles')
-    .select('role')
-    .eq('id', user.id)
-    .maybeSingle()
+  const supabase = await createClient()
 
-  if (meError) {
-    return NextResponse.json({ error: meError.message }, { status: 500 })
+  const body = await request.json().catch(() => null)
+  if (!body || typeof body !== 'object') {
+    return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
   }
 
-  const role = me?.role ?? 'student'
-  if (!['instructor', 'reviewer', 'admin'].includes(role)) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
+  const action = String(body.action ?? '').trim()
 
-  const allowed = await canManageAssignment(supabase, user.id, role, assignmentId)
-  if (!allowed) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  if (!action) {
+    return NextResponse.json({ error: 'action is required' }, { status: 400 })
   }
-
-  let body: any = {}
-  try {
-    body = await req.json()
-  } catch {
-    body = {}
-  }
-
-  const action = body.action ?? 'create'
 
   if (action === 'create') {
-    const { data: latest } = await supabase
+    const specName =
+      typeof body.spec_name === 'string' && body.spec_name.trim()
+        ? body.spec_name.trim()
+        : 'Layout Draft'
+
+    const pageCount = Math.max(1, Number(body.page_count ?? 1))
+    const validation = validateLayoutDataV2(body.layout_data, {
+      pageCountHint: pageCount,
+    })
+
+    if (!validation.ok) {
+      return NextResponse.json({ error: validation.error }, { status: 400 })
+    }
+
+    const { data: latestSpec, error: latestSpecError } = await supabase
       .from('assignment_layout_specs')
       .select('version')
       .eq('assignment_id', assignmentId)
@@ -193,12 +107,11 @@ export async function POST(
       .limit(1)
       .maybeSingle()
 
-    const nextVersion = Number(latest?.version ?? 0) + 1
-    const layoutData = body.layout_data ?? defaultLayoutData()
-    const pageCount =
-      body.page_count ??
-      layoutData?.page_count ??
-      (Array.isArray(layoutData?.pages) ? layoutData.pages.length : 1)
+    if (latestSpecError) {
+      return NextResponse.json({ error: latestSpecError.message }, { status: 500 })
+    }
+
+    const nextVersion = Number(latestSpec?.version ?? 0) + 1
 
     const { data, error } = await supabase
       .from('assignment_layout_specs')
@@ -206,137 +119,180 @@ export async function POST(
         assignment_id: assignmentId,
         version: nextVersion,
         is_active: false,
-        layout_data: layoutData,
-        created_by: user.id,
+        layout_data: validation.normalized,
+        created_by: userId,
         schema_version: 2,
-        spec_name: body.spec_name ?? `Layout v${nextVersion}`,
+        spec_name: specName,
         page_count: pageCount,
         layout_status: 'draft',
-        notes: body.notes ?? null,
+        notes: typeof body.notes === 'string' ? body.notes.trim() || null : null,
       })
-      .select(`
-        id,
-        assignment_id,
-        version,
-        is_active,
-        layout_data,
-        created_by,
-        created_at,
-        schema_version,
-        spec_name,
-        page_count,
-        layout_status,
-        approved_by,
-        approved_at,
-        notes
-      `)
+      .select('*')
       .single()
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 })
     }
 
-    return NextResponse.json({ ok: true, item: data })
+    return NextResponse.json({
+      item: data,
+      warnings: validation.warnings,
+    })
   }
 
   if (action === 'save') {
-    if (!body.spec_id) {
+    const specId = String(body.spec_id ?? '').trim()
+    if (!specId) {
       return NextResponse.json({ error: 'spec_id is required' }, { status: 400 })
     }
 
-    if (!body.layout_data || typeof body.layout_data !== 'object') {
-      return NextResponse.json({ error: 'layout_data object is required' }, { status: 400 })
+    const pageCount = Math.max(1, Number(body.page_count ?? 1))
+    const validation = validateLayoutDataV2(body.layout_data, {
+      pageCountHint: pageCount,
+    })
+
+    if (!validation.ok) {
+      return NextResponse.json({ error: validation.error }, { status: 400 })
     }
 
-    const pageCount =
-      body.page_count ??
-      body.layout_data?.page_count ??
-      (Array.isArray(body.layout_data?.pages) ? body.layout_data.pages.length : 1)
+    const patch: Record<string, any> = {
+      layout_data: validation.normalized,
+      page_count: pageCount,
+      schema_version: 2,
+    }
+
+    if (typeof body.spec_name === 'string') {
+      patch.spec_name = body.spec_name.trim() || null
+    }
+
+    if (typeof body.notes === 'string') {
+      patch.notes = body.notes.trim() || null
+    }
+
+    if (typeof body.layout_status === 'string' && body.layout_status.trim()) {
+      patch.layout_status = body.layout_status.trim()
+    }
 
     const { data, error } = await supabase
       .from('assignment_layout_specs')
-      .update({
-        layout_data: body.layout_data,
-        spec_name: body.spec_name ?? null,
-        page_count: pageCount,
-        notes: body.notes ?? null,
-        layout_status: body.layout_status ?? 'draft',
-      })
-      .eq('id', body.spec_id)
+      .update(patch)
+      .eq('id', specId)
       .eq('assignment_id', assignmentId)
-      .select(`
-        id,
-        assignment_id,
-        version,
-        is_active,
-        layout_data,
-        created_by,
-        created_at,
-        schema_version,
-        spec_name,
-        page_count,
-        layout_status,
-        approved_by,
-        approved_at,
-        notes
-      `)
+      .select('*')
       .single()
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 })
     }
 
-    return NextResponse.json({ ok: true, item: data })
+    return NextResponse.json({
+      item: data,
+      warnings: validation.warnings,
+    })
   }
 
   if (action === 'approve') {
-    if (!body.spec_id) {
+    const specId = String(body.spec_id ?? '').trim()
+    if (!specId) {
       return NextResponse.json({ error: 'spec_id is required' }, { status: 400 })
+    }
+
+    const { data: existing, error: existingError } = await supabase
+      .from('assignment_layout_specs')
+      .select('*')
+      .eq('id', specId)
+      .eq('assignment_id', assignmentId)
+      .maybeSingle()
+
+    if (existingError) {
+      return NextResponse.json({ error: existingError.message }, { status: 500 })
+    }
+
+    if (!existing) {
+      return NextResponse.json({ error: 'Layout spec not found' }, { status: 404 })
+    }
+
+    const validation = validateLayoutDataV2(existing.layout_data, {
+      pageCountHint: Number(existing.page_count ?? 1),
+    })
+
+    if (!validation.ok) {
+      return NextResponse.json(
+        { error: `Cannot approve invalid layout: ${validation.error}` },
+        { status: 400 }
+      )
     }
 
     const { data, error } = await supabase
       .from('assignment_layout_specs')
       .update({
+        layout_data: validation.normalized,
         layout_status: 'approved',
-        approved_by: user.id,
+        approved_by: userId,
         approved_at: new Date().toISOString(),
+        schema_version: 2,
       })
-      .eq('id', body.spec_id)
+      .eq('id', specId)
       .eq('assignment_id', assignmentId)
-      .select(`
-        id,
-        assignment_id,
-        version,
-        is_active,
-        layout_data,
-        created_by,
-        created_at,
-        schema_version,
-        spec_name,
-        page_count,
-        layout_status,
-        approved_by,
-        approved_at,
-        notes
-      `)
+      .select('*')
       .single()
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 })
     }
 
-    return NextResponse.json({ ok: true, item: data })
+    return NextResponse.json({
+      item: data,
+      warnings: validation.warnings,
+    })
   }
 
   if (action === 'set_active') {
-    if (!body.spec_id) {
+    const specId = String(body.spec_id ?? '').trim()
+    if (!specId) {
       return NextResponse.json({ error: 'spec_id is required' }, { status: 400 })
+    }
+
+    const { data: existing, error: existingError } = await supabase
+      .from('assignment_layout_specs')
+      .select('*')
+      .eq('id', specId)
+      .eq('assignment_id', assignmentId)
+      .maybeSingle()
+
+    if (existingError) {
+      return NextResponse.json({ error: existingError.message }, { status: 500 })
+    }
+
+    if (!existing) {
+      return NextResponse.json({ error: 'Layout spec not found' }, { status: 404 })
+    }
+
+    const validation = validateLayoutDataV2(existing.layout_data, {
+      pageCountHint: Number(existing.page_count ?? 1),
+    })
+
+    if (!validation.ok) {
+      return NextResponse.json(
+        { error: `Cannot activate invalid layout: ${validation.error}` },
+        { status: 400 }
+      )
+    }
+
+    if (existing.layout_status !== 'approved') {
+      return NextResponse.json(
+        { error: 'Only approved layout specs can be activated' },
+        { status: 400 }
+      )
     }
 
     const { error: deactivateError } = await supabase
       .from('assignment_layout_specs')
-      .update({ is_active: false })
+      .update({
+        is_active: false,
+      })
       .eq('assignment_id', assignmentId)
+      .eq('is_active', true)
 
     if (deactivateError) {
       return NextResponse.json({ error: deactivateError.message }, { status: 500 })
@@ -344,33 +300,29 @@ export async function POST(
 
     const { data, error } = await supabase
       .from('assignment_layout_specs')
-      .update({ is_active: true })
-      .eq('id', body.spec_id)
+      .update({
+        is_active: true,
+        layout_status: 'approved',
+        layout_data: validation.normalized,
+        schema_version: 2,
+      })
+      .eq('id', specId)
       .eq('assignment_id', assignmentId)
-      .select(`
-        id,
-        assignment_id,
-        version,
-        is_active,
-        layout_data,
-        created_by,
-        created_at,
-        schema_version,
-        spec_name,
-        page_count,
-        layout_status,
-        approved_by,
-        approved_at,
-        notes
-      `)
+      .select('*')
       .single()
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 })
     }
 
-    return NextResponse.json({ ok: true, item: data })
+    return NextResponse.json({
+      item: data,
+      warnings: validation.warnings,
+    })
   }
 
-  return NextResponse.json({ error: 'Unsupported action' }, { status: 400 })
+  return NextResponse.json(
+    { error: `Unsupported action: ${action}` },
+    { status: 400 }
+  )
 }

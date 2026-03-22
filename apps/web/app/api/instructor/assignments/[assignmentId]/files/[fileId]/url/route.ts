@@ -1,4 +1,3 @@
-//apps/web/app/api/instructor/assignments/[assignmentId]/files/[fileId]/url/route.ts
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 
@@ -41,6 +40,14 @@ async function canManageAssignment(
   }
 
   return false
+}
+
+function wantsJson(req: Request, url: URL) {
+  const format = url.searchParams.get('format')
+  if (format === 'json') return true
+
+  const accept = req.headers.get('accept') ?? ''
+  return accept.includes('application/json')
 }
 
 export async function GET(
@@ -105,6 +112,7 @@ export async function GET(
 
   const url = new URL(req.url)
   const mode = url.searchParams.get('mode') ?? 'preview'
+  const jsonMode = wantsJson(req, url)
 
   const { data: signed, error: signedError } = await supabase.storage
     .from(BUCKET)
@@ -116,9 +124,16 @@ export async function GET(
     return NextResponse.json({ error: signedError.message }, { status: 500 })
   }
 
+  const signedUrl = signed.signedUrl
+
+  if (!jsonMode) {
+    return NextResponse.redirect(signedUrl)
+  }
+
   return NextResponse.json({
     ok: true,
-    signed_url: signed.signedUrl,
+    url: signedUrl,
+    signed_url: signedUrl,
     file: fileRow,
   })
 }
