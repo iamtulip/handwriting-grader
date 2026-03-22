@@ -23,18 +23,20 @@ function buildEndOfFriday(dateStr: string) {
 
 export async function GET(
   _: Request,
-  { params }: { params: { assignmentId: string } }
+  context: { params: Promise<{ assignmentId: string }> }
 ) {
+  const { assignmentId } = await context.params
   const supabase = await createClient()
 
-  const { data: auth } = await supabase.auth.getUser()
-  if (!auth.user) {
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+
+  if (!user) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  const assignmentId = params.assignmentId
-
-  // 1) ดึง assignment
+  // 1) ดึง assignment แบบใช้เฉพาะคอลัมน์ที่มีจริงก่อน
   const { data: assignment, error: aErr } = await supabase
     .from('assignments')
     .select(`
@@ -45,35 +47,39 @@ export async function GET(
       week_number,
       class_date,
       open_at,
+      due_at,
       close_at,
-      is_online_class,
-      weight_attendance,
-      weight_submit_in_class,
-      weight_submit_same_day,
-      weight_submit_late,
-      weight_accuracy
+      end_of_friday_at,
+      is_online_class
     `)
     .eq('id', assignmentId)
     .maybeSingle()
 
   if (aErr || !assignment) {
-    return NextResponse.json({ error: 'Assignment not found' }, { status: 404 })
+    return NextResponse.json(
+      { error: aErr?.message || 'Assignment not found' },
+      { status: 404 }
+    )
   }
 
-  // 2) เช็คว่า assignment นี้อยู่ใน section ของ student จริง
-  const { data: studentSection } = await supabase
+  // 2) เช็กว่า assignment นี้อยู่ใน section ของ student จริง
+  const { data: studentSection, error: ssErr } = await supabase
     .from('student_sections')
     .select('section_id')
-    .eq('student_id', auth.user.id)
+    .eq('student_id', user.id)
     .eq('section_id', assignment.section_id)
     .maybeSingle()
+
+  if (ssErr) {
+    return NextResponse.json({ error: ssErr.message }, { status: 500 })
+  }
 
   if (!studentSection) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
   // 3) ดึง submission ของ student คนนี้
-  const { data: submission } = await supabase
+  const { data: submission, error: subErr } = await supabase
     .from('submissions')
     .select(`
       id,
@@ -85,8 +91,12 @@ export async function GET(
       extracted_paper_student_id
     `)
     .eq('assignment_id', assignmentId)
-    .eq('student_id', auth.user.id)
+    .eq('student_id', user.id)
     .maybeSingle()
+
+  if (subErr) {
+    return NextResponse.json({ error: subErr.message }, { status: 500 })
+  }
 
   // 4) ดึง grading results
   let grading = {
@@ -98,21 +108,21 @@ export async function GET(
   }
 
   if (submission?.id) {
-    const { data: grs } = await supabase
+    const { data: grs, error: grErr } = await supabase
       .from('grading_results')
       .select('auto_score, final_score, is_blank')
       .eq('submission_id', submission.id)
 
-    const list = grs ?? []
+    if (grErr) {
+      return NextResponse.json({ error: grErr.message }, { status: 500 })
+    }
 
+    const list = grs ?? []
     const totalAutoScore = list.reduce((s, r) => s + Number(r.auto_score ?? 0), 0)
     const totalFinalScore = list.reduce((s, r) => s + Number(r.final_score ?? 0), 0)
     const isBlankAny = list.some((r) => r.is_blank === true)
     const roiCount = list.length
 
-    // MVP heuristic:
-    // ถ้ามี roi_count > 0 ให้คำนวณเปอร์เซ็นต์จาก auto_score / roi_count
-    // (ภายหลังค่อยอัปเกรดเป็น max_points ต่อข้อจริง)
     const aiPercentage =
       roiCount > 0 && !isBlankAny
         ? Math.min(100, (totalAutoScore / roiCount) * 100)
@@ -127,7 +137,7 @@ export async function GET(
     }
   }
 
-  // 5) ดึง attendance จริงจาก class_sessions + attendance_checkins
+  // 5) attendance แบบ fallback-safe
   let attendance = {
     has_checkin: false,
     is_on_time: null as boolean | null,
@@ -139,9 +149,9 @@ export async function GET(
 
   let classSession: {
     id: string
-    starts_at: string
-    ends_at: string
-    class_date: string
+    starts_at: string | null
+    ends_at: string | null
+    class_date: string | null
   } | null = null
 
   if (assignment.section_id && assignment.class_date) {
@@ -159,7 +169,7 @@ export async function GET(
         .from('attendance_checkins')
         .select('session_id, check_in_time, is_on_time')
         .eq('session_id', session.id)
-        .eq('student_id', auth.user.id)
+        .eq('student_id', user.id)
         .maybeSingle()
 
       if (checkin) {
@@ -184,20 +194,21 @@ export async function GET(
     }
   }
 
-  // 6) meta score
+  // 6) meta score แบบใช้ default weights ก่อน
   const classEndsAt = classSession?.ends_at ?? null
   const endOfDay = assignment.class_date ? buildEndOfDay(assignment.class_date) : null
-  const endOfFriday = assignment.class_date ? buildEndOfFriday(assignment.class_date) : null
+  const endOfFriday =
+    assignment.class_date ? buildEndOfFriday(assignment.class_date) : null
 
   const meta = calculateMetaScore({
     assignmentType: assignment.assignment_type ?? 'weekly_exercise',
     isOnlineClass: assignment.is_online_class ?? false,
     weights: {
-      attendance: Number(assignment.weight_attendance ?? 1.0),
-      submitInClass: Number(assignment.weight_submit_in_class ?? 1.5),
-      submitSameDay: Number(assignment.weight_submit_same_day ?? 1.0),
-      submitLate: Number(assignment.weight_submit_late ?? 0.5),
-      accuracy: Number(assignment.weight_accuracy ?? 2.5),
+      attendance: 1.0,
+      submitInClass: 1.5,
+      submitSameDay: 1.0,
+      submitLate: 0.5,
+      accuracy: 2.5,
     },
     studentData: {
       isBlank: grading.is_blank_any,

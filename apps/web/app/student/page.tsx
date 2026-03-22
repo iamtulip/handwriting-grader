@@ -1,6 +1,33 @@
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/server'
 
+type SectionInfo = {
+  id: string
+  course_code: string | null
+  section_number: number | null
+  term: string | null
+}
+
+type StudentSectionRow = {
+  section_id: string
+  section?: SectionInfo[] | null
+}
+
+type AssignmentRow = {
+  id: string
+  title: string | null
+  week_number: number | null
+  class_date: string | null
+  assignment_type: string | null
+  open_at: string | null
+  due_at: string | null
+  close_at: string | null
+  created_at: string | null
+  section_id: string | null
+  is_online_class: boolean | null
+  section?: SectionInfo[] | null
+}
+
 async function getOverviewDirect() {
   const supabase = await createClient()
 
@@ -14,22 +41,35 @@ async function getOverviewDirect() {
 
   const { data: profile } = await supabase
     .from('user_profiles')
-    .select('full_name, student_id_number, registration_status')
+    .select('id, full_name, student_id_number, registration_status')
     .eq('id', user.id)
     .maybeSingle()
 
-  // ใช้ทุก section ที่นักศึกษาอยู่
-  const { data: studentSectionRows } = await supabase
+  const { data: studentSectionRows, error: sectionError } = await supabase
     .from('student_sections')
-    .select('section_id')
+    .select(`
+      section_id,
+      section:sections (
+        id,
+        course_code,
+        section_number,
+        term
+      )
+    `)
     .eq('student_id', user.id)
 
-  const sectionIds = (studentSectionRows ?? []).map((x) => x.section_id)
-  const primarySectionId = sectionIds[0] ?? null
+  if (sectionError) {
+    throw new Error(sectionError.message)
+  }
 
-  let assignments: any[] = []
+  const sectionRows = (studentSectionRows ?? []) as StudentSectionRow[]
+  const sectionIds = sectionRows.map((x) => x.section_id).filter(Boolean)
+  const primarySection = sectionRows[0]?.section?.[0] ?? null
+
+  let assignments: AssignmentRow[] = []
+
   if (sectionIds.length > 0) {
-    const { data } = await supabase
+    const { data, error: assignmentError } = await supabase
       .from('assignments')
       .select(`
         id,
@@ -38,16 +78,27 @@ async function getOverviewDirect() {
         class_date,
         assignment_type,
         open_at,
+        due_at,
         close_at,
         created_at,
         section_id,
-        is_online_class
+        is_online_class,
+        section:sections (
+          id,
+          course_code,
+          section_number,
+          term
+        )
       `)
       .in('section_id', sectionIds)
       .order('class_date', { ascending: false })
       .limit(50)
 
-    assignments = data ?? []
+    if (assignmentError) {
+      throw new Error(assignmentError.message)
+    }
+
+    assignments = (data ?? []) as AssignmentRow[]
   }
 
   const { data: subs } = await supabase
@@ -78,8 +129,15 @@ async function getOverviewDirect() {
       class_date: a.class_date ?? null,
       assignment_type: a.assignment_type ?? 'weekly_exercise',
       is_online_class: a.is_online_class ?? false,
+      section_id: a.section_id ?? null,
+      course_code: a.section?.[0]?.course_code ?? null,
+      section_number: a.section?.[0]?.section_number ?? null,
+      term: a.section?.[0]?.term ?? null,
+      open_at: a.open_at ?? null,
+      due_at: a.due_at ?? null,
+      close_at: a.close_at ?? null,
       status: s?.status ?? 'not_submitted',
-      total_score: s?.total_score ?? 0,
+      total_score: Number(s?.total_score ?? 0),
       submitted_at: s?.submitted_at ?? null,
       fraud_flag: s?.fraud_flag ?? false,
       needs_review:
@@ -95,15 +153,21 @@ async function getOverviewDirect() {
 
   const avgScore =
     submittedCount > 0
-      ? (subs ?? []).reduce((sum, x) => sum + Number(x.total_score ?? 0), 0) / submittedCount
+      ? (subs ?? []).reduce((sum, x) => sum + Number(x.total_score ?? 0), 0) /
+        submittedCount
       : 0
 
   return {
+    authUserId: user.id,
     profile: {
       full_name: profile?.full_name ?? null,
       student_id_number: profile?.student_id_number ?? null,
       registration_status: profile?.registration_status ?? null,
-      section_id: primarySectionId,
+    },
+    enrollment: {
+      count: sectionRows.length,
+      sections: sectionRows,
+      primarySection,
     },
     stats: {
       totalAssignments,
@@ -119,17 +183,48 @@ async function getOverviewDirect() {
 export default async function StudentOverviewPage() {
   const data = await getOverviewDirect()
 
+  const hasEnrollment = data.enrollment.count > 0
+  const primary = data.enrollment.primarySection
+
   return (
     <div className="space-y-8 max-w-6xl mx-auto">
       <header className="flex items-start justify-between gap-6">
         <div>
           <h1 className="text-3xl font-extrabold text-slate-900">Overview</h1>
           <p className="text-slate-600 mt-2 text-lg">
-            {data.profile.full_name ?? 'Student'} (รหัสนักศึกษา: {data.profile.student_id_number ?? '-'})
+            {data.profile.full_name ?? 'Student'} (รหัสนักศึกษา:{' '}
+            {data.profile.student_id_number ?? '-'})
           </p>
 
           <div className="mt-3">
             <StatusBadge status={data.profile.registration_status ?? 'pending'} />
+          </div>
+
+          <div className="mt-4 space-y-1 text-sm text-slate-600">
+            <div>
+              <span className="font-semibold text-slate-800">Auth User ID:</span>{' '}
+              {data.authUserId}
+            </div>
+            {primary ? (
+              <>
+                <div>
+                  <span className="font-semibold text-slate-800">รายวิชา:</span>{' '}
+                  {primary.course_code ?? '-'}
+                </div>
+                <div>
+                  <span className="font-semibold text-slate-800">กลุ่ม:</span>{' '}
+                  {primary.section_number ?? '-'}
+                </div>
+                <div>
+                  <span className="font-semibold text-slate-800">ภาคเรียน:</span>{' '}
+                  {primary.term ?? '-'}
+                </div>
+              </>
+            ) : (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-amber-700">
+                ยังไม่พบการผูกนักศึกษากับ section ในระบบ
+              </div>
+            )}
           </div>
         </div>
 
@@ -140,6 +235,18 @@ export default async function StudentOverviewPage() {
           ดูคะแนนรายสัปดาห์
         </Link>
       </header>
+
+      {!hasEnrollment && (
+        <section className="rounded-xl border border-red-200 bg-red-50 p-4 text-red-700 font-semibold">
+          นักศึกษายังไม่ถูกผูกกับ section ใด ๆ ในตาราง student_sections จึงไม่สามารถเห็นงานได้
+        </section>
+      )}
+
+      {hasEnrollment && data.stats.totalAssignments === 0 && (
+        <section className="rounded-xl border border-amber-200 bg-amber-50 p-4 text-amber-700 font-semibold">
+          นักศึกษาอยู่ใน section แล้ว แต่ยังไม่พบ assignment ของ section นี้ในมุมมองที่หน้า student ใช้
+        </section>
+      )}
 
       <section className="grid grid-cols-1 md:grid-cols-5 gap-4">
         <Card title="งานทั้งหมด (Assignments)" value={String(data.stats.totalAssignments)} />
@@ -160,7 +267,9 @@ export default async function StudentOverviewPage() {
               <tr>
                 <th className="text-left p-4 font-medium">สัปดาห์</th>
                 <th className="text-left p-4 font-medium">ชื่องาน</th>
-                <th className="text-left p-4 font-medium">วันที่เรียน</th>
+                <th className="text-left p-4 font-medium">รายวิชา/กลุ่ม</th>
+                <th className="text-left p-4 font-medium">เปิด</th>
+                <th className="text-left p-4 font-medium">กำหนดส่ง</th>
                 <th className="text-left p-4 font-medium">สถานะ</th>
                 <th className="text-right p-4 font-medium">คะแนนรวม</th>
                 <th className="text-center p-4 font-medium">Flags</th>
@@ -173,12 +282,16 @@ export default async function StudentOverviewPage() {
                 <tr key={r.assignment_id} className="hover:bg-slate-50 transition-colors">
                   <td className="p-4">{r.week_number ?? '-'}</td>
                   <td className="p-4 font-semibold text-slate-800">{r.title}</td>
-                  <td className="p-4 text-slate-600">{r.class_date ?? '-'}</td>
+                  <td className="p-4 text-slate-600">
+                    {r.course_code ?? '-'} / Sec {r.section_number ?? '-'} ({r.term ?? '-'})
+                  </td>
+                  <td className="p-4 text-slate-600">{formatDateTime(r.open_at)}</td>
+                  <td className="p-4 text-slate-600">{formatDateTime(r.due_at)}</td>
                   <td className="p-4">
                     <StatusBadge status={r.status ?? '-'} />
                   </td>
                   <td className="p-4 text-right font-bold text-blue-600">
-                    {(r.total_score ?? 0).toFixed(2)}
+                    {Number(r.total_score ?? 0).toFixed(2)}
                   </td>
                   <td className="p-4 text-center">
                     <div className="flex justify-center gap-2">
@@ -207,7 +320,7 @@ export default async function StudentOverviewPage() {
 
               {data.recent.length === 0 && (
                 <tr>
-                  <td className="p-8 text-center text-slate-500" colSpan={7}>
+                  <td className="p-8 text-center text-slate-500" colSpan={9}>
                     ยังไม่มีข้อมูลการส่งงาน
                   </td>
                 </tr>
@@ -251,4 +364,11 @@ function StatusBadge({ status }: { status: string }) {
       {status}
     </span>
   )
+}
+
+function formatDateTime(value?: string | null) {
+  if (!value) return '-'
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return value
+  return d.toLocaleString('th-TH')
 }

@@ -128,6 +128,7 @@ export async function PATCH(
     close_at: body.close_at || null,
     end_of_friday_at: body.end_of_friday_at || null,
     updated_at: new Date().toISOString(),
+    is_online_class: Boolean(body.is_online_class ?? false),
   }
 
   const { data, error } = await supabase
@@ -146,7 +147,8 @@ export async function PATCH(
       close_at,
       end_of_friday_at,
       is_archived,
-      updated_at
+      updated_at,
+      is_online_class,
     `)
     .single()
 

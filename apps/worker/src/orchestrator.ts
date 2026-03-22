@@ -1,5 +1,5 @@
-// apps/worker/src/diamond/orchestrator.ts
-import { supabase } from '../lib/supabase'
+import 'dotenv/config'
+import { supabase } from './lib/supabase'
 import { loadContext } from './stages/load_context'
 import { runAlignmentForPage } from './stages/alignment'
 import { cropRoisForPage } from './stages/roi_crop'
@@ -11,95 +11,119 @@ import { finalizeSubmission } from './stages/finalize'
 import { setStage } from './utils/stage'
 
 const POLL_INTERVAL_MS = 3000
+const PIPELINE_VERSION = 'v2'
+
+async function lockNextJob(): Promise<string | null> {
+  const { data: jobs, error } = await supabase
+    .from('submissions')
+    .select('id')
+    .eq('pipeline_version', PIPELINE_VERSION)
+    .in('current_stage', ['pending', 'v2:queued'])
+    .limit(1)
+
+  if (error) {
+    console.error('[worker] failed to poll jobs', error)
+    return null
+  }
+
+  if (!jobs || jobs.length === 0) {
+    return null
+  }
+
+  const submissionId = jobs[0].id as string
+
+  const { data: locked, error: lockError } = await supabase
+    .from('submissions')
+    .update({ current_stage: 'v2:queued' })
+    .eq('id', submissionId)
+    .in('current_stage', ['pending', 'v2:queued'])
+    .select('id')
+    .single()
+
+  if (lockError || !locked) {
+    return null
+  }
+
+  return submissionId
+}
 
 export async function pollAndProcessV2() {
   try {
-    // 1) ดึงงานที่พร้อมทำ (คุมด้วย pipeline_version)
-    const { data: jobs } = await supabase
-      .from('submissions')
-      .select('id')
-      .eq('pipeline_version', 'v2')
-      .in('current_stage', ['pending', 'v2:queued'])
-      .limit(1)
-
-    if (!jobs || jobs.length === 0) return
-
-    const submissionId = jobs[0].id
-
-    // 2) Atomic lock กัน worker แย่งกันทำ
-    const { data: locked } = await supabase
-      .from('submissions')
-      .update({ current_stage: 'v2:queued' })
-      .eq('id', submissionId)
-      .in('current_stage', ['pending', 'v2:queued'])
-      .select('id')
-      .single()
-
-    if (!locked) return
-
+    const submissionId = await lockNextJob()
+    if (!submissionId) return
     await processSubmissionV2(submissionId)
-  } catch (e) {
-    console.error('[V2] poll error', e)
+  } catch (error) {
+    console.error('[worker] pollAndProcessV2 error', error)
   }
 }
 
 export async function processSubmissionV2(submissionId: string) {
-  // โหลด context (submission + locked spec + pages + layout)
   const ctx = await loadContext(submissionId)
 
-  // ===== Multi-page loop =====
-  for (const pageFile of ctx.pages) {
-    const pageNo = pageFile.page_number
+  try {
+    await setStage(submissionId, 'v2:loading_context')
 
-    await setStage(submissionId, `v2:aligning:p${pageNo}`)
+    for (const pageFile of ctx.pages) {
+      const pageNo = pageFile.page_number
 
-    // 1) Alignment per page (สร้าง aligned artifact)
-    const align = await runAlignmentForPage(ctx, pageFile)
+      await setStage(submissionId, `v2:aligning:p${pageNo}`)
+      const alignment = await runAlignmentForPage(ctx, pageFile)
 
-    await setStage(submissionId, `v2:cropping:p${pageNo}`)
+      await setStage(submissionId, `v2:cropping:p${pageNo}`)
+      const roiCrops = await cropRoisForPage(ctx, pageNo, alignment)
 
-    // 2) Crop ROIs per page (ได้รายการ roi crops)
-    const roiCrops = await cropRoisForPage(ctx, pageNo, align)
+      for (const roi of roiCrops) {
+        await setStage(submissionId, `v2:ocr:p${pageNo}:roi:${roi.roi_id}`)
+        const rawCandidates = await runOcrEnsembleForRoi(ctx, roi)
 
-    // 3) ROI loop
-    for (const roi of roiCrops) {
-      await setStage(submissionId, `v2:ocr:p${pageNo}:roi:${roi.roi_id}`)
+        await setStage(submissionId, `v2:candidates:p${pageNo}:roi:${roi.roi_id}`)
+        const dbCandidates = await persistCandidates(ctx, roi, rawCandidates)
 
-      // 3.1 OCR ensemble (A/B/Mathpix เฉพาะจำเป็น)
-      const rawCandidates = await runOcrEnsembleForRoi(ctx, roi)
+        await setStage(submissionId, `v2:grading:p${pageNo}:roi:${roi.roi_id}`)
+        const grade = await deterministicGradeRoi(ctx, roi, dbCandidates)
 
-      await setStage(submissionId, `v2:candidates:p${pageNo}:roi:${roi.roi_id}`)
+        await setStage(submissionId, `v2:verify:p${pageNo}:roi:${roi.roi_id}`)
+        const final = await verifyRoiIfNeeded(ctx, roi, dbCandidates, grade)
 
-      // 3.2 Persist candidates (audit-ready + idempotent)
-      const dbCandidates = await persistCandidates(ctx, roi, rawCandidates)
+        const { error } = await supabase.from('grading_results').upsert(
+          {
+            submission_id: submissionId,
+            roi_id: roi.roi_id,
+            page_number: pageNo,
+            layout_spec_version: ctx.layoutSpec.version,
+            auto_score: final.auto_score,
+            final_score: final.final_score,
+            selected_candidate_id: final.selected_candidate_id,
+            evidence_map: final.evidence_map ?? null,
+            is_human_override: false,
+          },
+          { onConflict: 'submission_id,roi_id,page_number,layout_spec_version' as any }
+        )
 
-      await setStage(submissionId, `v2:grading:roi:${roi.roi_id}`)
-
-      // 3.3 Deterministic grading (math normalizer + tolerance)
-      const grade = await deterministicGradeRoi(ctx, roi, dbCandidates)
-
-      // 3.4 Verifier only if needed (disagree/low confidence)
-      const final = await verifyRoiIfNeeded(ctx, roi, dbCandidates, grade)
-
-      // 3.5 Save grading_results (selected_candidate_id + evidence_map)
-      await supabase.from('grading_results').upsert({
-        submission_id: submissionId,
-        roi_id: roi.roi_id,
-        page_number: pageNo,
-        layout_spec_version: ctx.layoutSpec.version,
-        auto_score: final.auto_score,
-        final_score: final.final_score,
-        selected_candidate_id: final.selected_candidate_id,
-        evidence_map: final.evidence_map ?? null,
-        is_human_override: false
-      }, { onConflict: 'submission_id,roi_id,page_number,layout_spec_version' as any })
+        if (error) {
+          throw error
+        }
+      }
     }
-  }
 
-  // ===== Finalize =====
-  await finalizeSubmission(ctx)
-  await setStage(submissionId, 'v2:done')
+    await finalizeSubmission(ctx)
+    await setStage(submissionId, 'v2:done')
+  } catch (error: any) {
+    console.error(`[worker] processSubmissionV2 failed for ${submissionId}`, error)
+
+    await supabase
+      .from('submissions')
+      .update({
+        current_stage: 'v2:error',
+        status: 'needs_review',
+        last_error: error?.message ?? 'Unknown worker error',
+      })
+      .eq('id', submissionId)
+
+    throw error
+  }
 }
 
-// loop runner
-setInterval(() => pollAndProcessV2(), POLL_INTERVAL_MS)
+setInterval(() => {
+  void pollAndProcessV2()
+}, POLL_INTERVAL_MS)

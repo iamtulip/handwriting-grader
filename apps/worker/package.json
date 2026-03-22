@@ -2,11 +2,11 @@
   "name": "grading-worker",
   "version": "1.0.0",
   "description": "Hybrid AI-Deterministic Grading Worker",
-  "main": "dist/index.js",
+  "main": "dist/orchestrator.js",
   "scripts": {
-    "dev": "ts-node src/index.ts",
+    "dev": "ts-node src/orchestrator.ts",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/orchestrator.js"
   },
   "dependencies": {
     "@google-cloud/vision": "^4.2.1",

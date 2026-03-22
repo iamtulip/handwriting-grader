@@ -9,11 +9,13 @@ async function getDetail(assignmentId: string) {
     cache: 'no-store',
     headers: {
       Cookie: cookieStore.toString(),
+      Accept: 'application/json',
     },
   })
 
   if (!res.ok) {
-    throw new Error('Failed to load weekly detail')
+    const err = await res.json().catch(() => null)
+    throw new Error(err?.error || `Failed to load weekly detail (${res.status})`)
   }
 
   return res.json()
@@ -22,9 +24,10 @@ async function getDetail(assignmentId: string) {
 export default async function WeeklyDetailPage({
   params,
 }: {
-  params: { assignmentId: string }
+  params: Promise<{ assignmentId: string }>
 }) {
-  const data = await getDetail(params.assignmentId)
+  const { assignmentId } = await params
+  const data = await getDetail(assignmentId)
 
   return (
     <div className="space-y-6 max-w-6xl mx-auto">
@@ -45,16 +48,19 @@ export default async function WeeklyDetailPage({
 
         <Link
           className="px-4 py-2 bg-slate-100 text-slate-700 font-bold rounded-lg hover:bg-slate-200 transition-colors shadow-sm"
-          href="/student/weekly"
+          href="/student"
         >
-          ← กลับหน้ารวม
+          ← กลับหน้า Overview
         </Link>
       </header>
 
       <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <Box title="สถานะการส่ง" value={data.submission.status ?? 'not_submitted'} />
         <Box title="คะแนนรวม (Meta)" value={Number(data.meta.total ?? 0).toFixed(2)} />
-        <Box title="คะแนนเต็มสัปดาห์นี้" value={Number(data.meta.totalPossible ?? 0).toFixed(2)} />
+        <Box
+          title="คะแนนเต็มสัปดาห์นี้"
+          value={Number(data.meta.totalPossible ?? 0).toFixed(2)}
+        />
         <Box title="จำนวนจุดที่ตรวจ (ROI)" value={String(data.grading.roi_count ?? 0)} />
       </section>
 
@@ -94,10 +100,22 @@ export default async function WeeklyDetailPage({
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm mt-4">
-          <Row label="คะแนนจาก AI (Auto)" value={Number(data.grading.total_auto_score ?? 0).toFixed(2)} />
-          <Row label="คะแนนสุทธิ (Final Raw)" value={Number(data.grading.total_final_score ?? 0).toFixed(2)} />
-          <Row label="เปอร์เซ็นต์ความถูกต้อง (AI %)" value={Number(data.grading.ai_percentage ?? 0).toFixed(2)} />
-          <Row label="พบกระดาษเปล่า" value={data.grading.is_blank_any ? 'ใช่ (YES)' : 'ไม่ใช่ (NO)'} />
+          <Row
+            label="คะแนนจาก AI (Auto)"
+            value={Number(data.grading.total_auto_score ?? 0).toFixed(2)}
+          />
+          <Row
+            label="คะแนนสุทธิ (Final Raw)"
+            value={Number(data.grading.total_final_score ?? 0).toFixed(2)}
+          />
+          <Row
+            label="เปอร์เซ็นต์ความถูกต้อง (AI %)"
+            value={Number(data.grading.ai_percentage ?? 0).toFixed(2)}
+          />
+          <Row
+            label="พบกระดาษเปล่า"
+            value={data.grading.is_blank_any ? 'ใช่ (YES)' : 'ไม่ใช่ (NO)'}
+          />
         </div>
       </section>
 
@@ -114,8 +132,8 @@ export default async function WeeklyDetailPage({
               data.attendance.is_on_time === null
                 ? '-'
                 : data.attendance.is_on_time
-                ? 'ใช่ (YES)'
-                : 'ไม่ใช่ (NO)'
+                  ? 'ใช่ (YES)'
+                  : 'ไม่ใช่ (NO)'
             }
           />
           <Row
@@ -194,10 +212,18 @@ function ScoreBox({
           : 'rounded-xl border border-slate-200 bg-white p-5 shadow-sm'
       }
     >
-      <div className={highlight ? 'text-sm text-slate-300 font-medium' : 'text-sm text-slate-500 font-medium'}>
+      <div
+        className={
+          highlight
+            ? 'text-sm text-slate-300 font-medium'
+            : 'text-sm text-slate-500 font-medium'
+        }
+      >
         {title}
       </div>
-      <div className="text-2xl font-extrabold mt-2">{Number(value ?? 0).toFixed(2)}</div>
+      <div className="text-2xl font-extrabold mt-2">
+        {Number(value ?? 0).toFixed(2)}
+      </div>
     </div>
   )
 }

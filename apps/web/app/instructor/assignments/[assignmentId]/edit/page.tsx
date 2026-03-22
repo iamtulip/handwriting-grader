@@ -14,6 +14,7 @@ type FormState = {
   due_at: string
   close_at: string
   end_of_friday_at: string
+  is_online_class: boolean
 }
 
 export default function EditAssignmentPage() {
@@ -36,6 +37,7 @@ export default function EditAssignmentPage() {
     due_at: '',
     close_at: '',
     end_of_friday_at: '',
+    is_online_class: false,
   })
 
   async function loadData() {
@@ -59,6 +61,7 @@ export default function EditAssignmentPage() {
       due_at: toDateTimeLocal(a.due_at),
       close_at: toDateTimeLocal(a.close_at),
       end_of_friday_at: toDateTimeLocal(a.end_of_friday_at),
+      is_online_class: Boolean(a.is_online_class ?? false),
     })
   }
 
@@ -95,10 +98,11 @@ export default function EditAssignmentPage() {
         assignment_type: form.assignment_type,
         week_number: form.week_number.trim() === '' ? null : Number(form.week_number),
         class_date: form.class_date || null,
-        open_at: form.open_at || null,
-        due_at: form.due_at || null,
-        close_at: form.close_at || null,
-        end_of_friday_at: form.end_of_friday_at || null,
+        open_at: form.open_at ? new Date(form.open_at).toISOString() : null,
+        due_at: form.due_at ? new Date(form.due_at).toISOString() : null,
+        close_at: form.close_at ? new Date(form.close_at).toISOString() : null,
+        end_of_friday_at: form.end_of_friday_at ? new Date(form.end_of_friday_at).toISOString() : null,
+        is_online_class: Boolean(form.is_online_class),
       }
 
       const res = await fetch(`/api/instructor/assignments/${assignmentId}/manage`, {
@@ -262,6 +266,18 @@ export default function EditAssignmentPage() {
               onChange={(e) => setField('end_of_friday_at', e.target.value)}
               className="w-full rounded-lg border border-slate-300 px-4 py-3"
             />
+          </Field>
+
+          <Field label="Online Class">
+            <label className="inline-flex items-center gap-3">
+              <input
+              type="checkbox"
+              checked={form.is_online_class}
+              onChange={(e) => setField('is_online_class', e.target.checked)}
+              className="h-4 w-4"
+            />
+            <span>งานนี้เป็นแบบฝึกหัดสำหรับคลาสออนไลน์</span>
+            </label>
           </Field>
         </div>
 
