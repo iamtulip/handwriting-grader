@@ -1,5 +1,6 @@
 import Link from 'next/link'
 import { cookies } from 'next/headers'
+import UploadSubmissionForm from './upload-form'
 
 async function getDetail(assignmentId: string) {
   const cookieStore = await cookies()
@@ -64,6 +65,13 @@ export default async function WeeklyDetailPage({
         <Box title="จำนวนจุดที่ตรวจ (ROI)" value={String(data.grading.roi_count ?? 0)} />
       </section>
 
+      <UploadSubmissionForm
+        assignmentId={assignmentId}
+        currentStatus={data.submission.status ?? 'not_submitted'}
+        openAt={data.assignment.open_at}
+        closeAt={data.assignment.close_at}
+      />
+
       <section className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
         <div className="font-bold text-slate-800 text-lg border-b border-slate-100 pb-2">
           คะแนนรายส่วน (Meta Score Breakdown)
@@ -92,95 +100,6 @@ export default async function WeeklyDetailPage({
             value={data.assignment.is_online_class ? 'ใช่ (YES)' : 'ไม่ใช่ (NO)'}
           />
         </div>
-      </section>
-
-      <section className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
-        <div className="font-bold text-slate-800 text-lg border-b border-slate-100 pb-2">
-          รายละเอียดการตรวจจากระบบ
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm mt-4">
-          <Row
-            label="คะแนนจาก AI (Auto)"
-            value={Number(data.grading.total_auto_score ?? 0).toFixed(2)}
-          />
-          <Row
-            label="คะแนนสุทธิ (Final Raw)"
-            value={Number(data.grading.total_final_score ?? 0).toFixed(2)}
-          />
-          <Row
-            label="เปอร์เซ็นต์ความถูกต้อง (AI %)"
-            value={Number(data.grading.ai_percentage ?? 0).toFixed(2)}
-          />
-          <Row
-            label="พบกระดาษเปล่า"
-            value={data.grading.is_blank_any ? 'ใช่ (YES)' : 'ไม่ใช่ (NO)'}
-          />
-        </div>
-      </section>
-
-      <section className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-4">
-        <div className="font-bold text-slate-800 text-lg border-b border-slate-100 pb-2">
-          Attendance / Check-in
-        </div>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm mt-4">
-          <Row label="มีข้อมูล check-in" value={data.attendance.has_checkin ? 'มี' : 'ไม่มี'} />
-          <Row
-            label="เข้าเรียนทันเวลา"
-            value={
-              data.attendance.is_on_time === null
-                ? '-'
-                : data.attendance.is_on_time
-                  ? 'ใช่ (YES)'
-                  : 'ไม่ใช่ (NO)'
-            }
-          />
-          <Row
-            label="เวลา check-in"
-            value={
-              data.attendance.check_in_time
-                ? new Date(data.attendance.check_in_time).toLocaleString('th-TH')
-                : '-'
-            }
-          />
-          <Row label="Session ID" value={data.attendance.session_id ?? '-'} />
-        </div>
-      </section>
-
-      {(data.submission.fraud_flag || data.submission.extracted_paper_student_id) && (
-        <section className="border border-red-200 bg-red-50 rounded-xl p-6 shadow-sm">
-          <div className="font-bold text-red-700 mb-3">
-            ⚠️ ระบบตรวจสอบความโปร่งใส (Integrity Check)
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
-            <Row
-              label="พบความผิดปกติ"
-              value={data.submission.fraud_flag ? 'TRUE' : 'FALSE'}
-            />
-            <Row
-              label="รหัสนักศึกษาบนกระดาษ"
-              value={data.submission.extracted_paper_student_id ?? '-'}
-            />
-          </div>
-        </section>
-      )}
-
-      <section className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm">
-        <div className="font-bold text-slate-800 text-lg border-b border-slate-100 pb-2 mb-4">
-          หมายเหตุการคิดคะแนน
-        </div>
-
-        {Array.isArray(data.meta.note) && data.meta.note.length > 0 ? (
-          <ul className="list-disc pl-6 space-y-2 text-sm text-slate-700">
-            {data.meta.note.map((n: string, idx: number) => (
-              <li key={idx}>{n}</li>
-            ))}
-          </ul>
-        ) : (
-          <p className="text-sm text-slate-500">ไม่มีหมายเหตุเพิ่มเติม</p>
-        )}
       </section>
     </div>
   )

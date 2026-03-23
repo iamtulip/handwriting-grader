@@ -129,10 +129,11 @@ export async function POST(
         status: 'uploaded',
         submitted_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-        current_stage: 'upload_completed',
+        current_stage: 'pending',
+        pipeline_version: 'v2',
         fraud_flag: false,
         extracted_paper_student_id: null,
-      })
+  })
       .eq('id', submissionId)
   } else {
     const { data: createdSubmission, error: createSubmissionError } = await supabase
@@ -143,8 +144,9 @@ export async function POST(
         status: 'uploaded',
         submitted_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
-        current_stage: 'upload_completed',
-      })
+        current_stage: 'pending',
+      pipeline_version: 'v2',
+})
       .select('id')
       .single()
 
