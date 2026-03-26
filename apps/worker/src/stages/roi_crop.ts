@@ -1,53 +1,118 @@
-import type { WorkerContext, WorkerRegion } from './load_context'
-import type { AlignmentResult } from './alignment'
+import type { WorkerContext } from './load_context'
 
 export type RoiCrop = {
   roi_id: string
   page_number: number
-  kind: string
-  question_no: number | null
-  subquestion_no: string | null
-  part_no: string | null
-  group_id: string | null
+  kind: string | null
+  item_no: string | null
   answer_type: string | null
-  score_weight: number
-  grader: Record<string, unknown> | null
-  crop_storage_path: string
+  points: number | null
   bbox_norm: [number, number, number, number] | null
+  crop_storage_path: string | null
+  region: any
 }
 
-function isCropEligible(region: WorkerRegion) {
-  return ['answer', 'table_cell', 'identity', 'working'].includes(region.kind)
+function toBBoxNorm(region: any): [number, number, number, number] | null {
+  if (
+    region &&
+    Number.isFinite(Number(region.x_norm)) &&
+    Number.isFinite(Number(region.y_norm)) &&
+    Number.isFinite(Number(region.w_norm)) &&
+    Number.isFinite(Number(region.h_norm))
+  ) {
+    return [
+      Number(region.x_norm),
+      Number(region.y_norm),
+      Number(region.w_norm),
+      Number(region.h_norm),
+    ]
+  }
+
+  if (
+    region &&
+    Array.isArray(region.bbox_norm) &&
+    region.bbox_norm.length === 4 &&
+    region.bbox_norm.every((v: unknown) => Number.isFinite(Number(v)))
+  ) {
+    return [
+      Number(region.bbox_norm[0]),
+      Number(region.bbox_norm[1]),
+      Number(region.bbox_norm[2]),
+      Number(region.bbox_norm[3]),
+    ]
+  }
+
+  return null
+}
+
+function normalizeItemNo(region: any): string | null {
+  const raw =
+    region?.item_no ??
+    region?.question_no ??
+    region?.questionNumber ??
+    region?.question_no_text ??
+    null
+
+  if (raw == null) return null
+
+  const s = String(raw).trim()
+  return s.length > 0 ? s : null
+}
+
+function normalizeAnswerType(region: any): string | null {
+  const raw =
+    region?.answer_type ??
+    region?.expected_type ??
+    region?.grader_mode ??
+    null
+
+  if (raw == null) return null
+
+  const s = String(raw).trim()
+  return s.length > 0 ? s : null
+}
+
+function normalizePoints(region: any): number | null {
+  const raw = region?.points ?? region?.score_weight ?? null
+  if (raw == null) return null
+
+  const n = Number(raw)
+  return Number.isFinite(n) ? n : null
+}
+
+function normalizeRoiId(region: any): string {
+  return String(region?.roi_id ?? region?.id ?? crypto.randomUUID())
 }
 
 export async function cropRoisForPage(
   ctx: WorkerContext,
   pageNumber: number,
-  alignment: AlignmentResult
+  _alignment: any
 ): Promise<RoiCrop[]> {
-  const page = ctx.layoutSpec.layout_data.pages.find((p) => p.page_number === pageNumber)
-  if (!page) return []
+  const pages = Array.isArray(ctx.layoutSpec.layout_data?.pages)
+    ? ctx.layoutSpec.layout_data.pages
+    : []
 
-  const output: RoiCrop[] = []
+  const pageSpec = pages.find((p: any) => Number(p?.page_number) === Number(pageNumber))
+  if (!pageSpec) return []
 
-  for (const region of page.regions) {
-    if (!isCropEligible(region)) continue
+  const regions = Array.isArray(pageSpec?.regions) ? pageSpec.regions : []
 
-    output.push({
-      roi_id: region.id,
-      page_number: pageNumber,
-      kind: region.kind,
-      question_no: region.question_no ?? null,
-      subquestion_no: region.subquestion_no ?? null,
-      part_no: region.part_no ?? null,
-      group_id: region.group_id ?? null,
-      answer_type: region.answer_type ?? null,
-      score_weight: Number(region.score_weight ?? 1),
-      grader: region.grader ?? null,
-      crop_storage_path: `${alignment.aligned_storage_path}#roi=${region.id}`,
-      bbox_norm: region.bbox_norm ?? null,
-    })
-  }
+  const rois: RoiCrop[] = regions
+    .filter((region: any) =>
+      ['answer', 'table_cell', 'working'].includes(String(region?.kind ?? ''))
+    )
+    .map((region: any) => ({
+      roi_id: normalizeRoiId(region),
+      page_number: Number(pageNumber),
+      kind: region?.kind ?? null,
+      item_no: normalizeItemNo(region),
+      answer_type: normalizeAnswerType(region),
+      points: normalizePoints(region),
+      bbox_norm: toBBoxNorm(region),
+      crop_storage_path: null,
+      region,
+    }))
 
-  return output
+  return rois
 }

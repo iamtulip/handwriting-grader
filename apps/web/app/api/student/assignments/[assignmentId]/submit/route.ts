@@ -1,10 +1,50 @@
-//apps/web/app/api/student/assignments/[assignmentId]/submit/route.ts
 import { NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
 
 export const runtime = 'nodejs'
 
 const BUCKET = 'submission-files'
+
+function getSafeExtension(fileName: string, mimeType?: string) {
+  const extFromName = fileName.includes('.')
+    ? fileName.split('.').pop()?.toLowerCase() ?? ''
+    : ''
+
+  const allowed = new Set([
+    'jpg',
+    'jpeg',
+    'png',
+    'webp',
+    'pdf',
+    'heic',
+    'heif',
+  ])
+
+  if (allowed.has(extFromName)) return extFromName
+
+  const mime = (mimeType || '').toLowerCase()
+  if (mime.includes('jpeg')) return 'jpg'
+  if (mime.includes('png')) return 'png'
+  if (mime.includes('webp')) return 'webp'
+  if (mime.includes('pdf')) return 'pdf'
+  if (mime.includes('heic')) return 'heic'
+  if (mime.includes('heif')) return 'heif'
+
+  return 'bin'
+}
+
+function buildSafeStoragePath(
+  assignmentId: string,
+  userId: string,
+  submissionId: string,
+  pageNumber: number,
+  fileName: string,
+  mimeType?: string
+) {
+  const ext = getSafeExtension(fileName, mimeType)
+  const unique = crypto.randomUUID()
+  return `${assignmentId}/${userId}/${submissionId}/page-${pageNumber}-${Date.now()}-${unique}.${ext}`
+}
 
 async function canStudentAccessAssignment(
   supabase: any,
@@ -93,7 +133,6 @@ export async function POST(
     return NextResponse.json({ error: 'Invalid files' }, { status: 400 })
   }
 
-  // create or reuse submission row
   let submissionId: string | null = null
 
   const { data: existingSubmission, error: existingSubmissionError } = await supabase
@@ -110,18 +149,23 @@ export async function POST(
   if (existingSubmission?.id) {
     submissionId = existingSubmission.id
 
-    // remove old submission_files rows and storage objects first
     const { data: oldFiles } = await supabase
       .from('submission_files')
       .select('id, storage_path')
       .eq('submission_id', submissionId)
 
-    const oldPaths = (oldFiles ?? []).map((x: any) => x.storage_path).filter(Boolean)
+    const oldPaths = (oldFiles ?? [])
+      .map((x: any) => x.storage_path)
+      .filter(Boolean)
+
     if (oldPaths.length > 0) {
       await supabase.storage.from(BUCKET).remove(oldPaths)
     }
 
-    await supabase.from('submission_files').delete().eq('submission_id', submissionId)
+    await supabase
+      .from('submission_files')
+      .delete()
+      .eq('submission_id', submissionId)
 
     await supabase
       .from('submissions')
@@ -133,7 +177,7 @@ export async function POST(
         pipeline_version: 'v2',
         fraud_flag: false,
         extracted_paper_student_id: null,
-  })
+      })
       .eq('id', submissionId)
   } else {
     const { data: createdSubmission, error: createSubmissionError } = await supabase
@@ -145,8 +189,8 @@ export async function POST(
         submitted_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
         current_stage: 'pending',
-      pipeline_version: 'v2',
-})
+        pipeline_version: 'v2',
+      })
       .select('id')
       .single()
 
@@ -162,12 +206,19 @@ export async function POST(
   }
 
   const insertedFiles: any[] = []
+  const uploadedPaths: string[] = []
 
   for (let i = 0; i < normalizedFiles.length; i += 1) {
     const file = normalizedFiles[i]
     const pageNumber = i + 1
-    const safeName = file.name.replace(/[^\w.\-ก-๙ ]/g, '_')
-    const storagePath = `${assignmentId}/${user.id}/${submissionId}/page-${pageNumber}-${Date.now()}-${safeName}`
+    const storagePath = buildSafeStoragePath(
+      assignmentId,
+      user.id,
+      submissionId,
+      pageNumber,
+      file.name,
+      file.type
+    )
 
     const arrayBuffer = await file.arrayBuffer()
     const buffer = Buffer.from(arrayBuffer)
@@ -180,8 +231,13 @@ export async function POST(
       })
 
     if (uploadError) {
+      if (uploadedPaths.length > 0) {
+        await supabase.storage.from(BUCKET).remove(uploadedPaths)
+      }
       return NextResponse.json({ error: uploadError.message }, { status: 500 })
     }
+
+    uploadedPaths.push(storagePath)
 
     const { data: fileRow, error: insertFileError } = await supabase
       .from('submission_files')
@@ -200,6 +256,7 @@ export async function POST(
       .single()
 
     if (insertFileError) {
+      await supabase.storage.from(BUCKET).remove([storagePath])
       return NextResponse.json({ error: insertFileError.message }, { status: 500 })
     }
 
@@ -207,9 +264,10 @@ export async function POST(
   }
 
   try {
-    if (process.env.PIPELINE_SECRET) {
+    const appUrl = process.env.NEXT_PUBLIC_APP_URL
+    if (process.env.PIPELINE_SECRET && appUrl) {
       await fetch(
-        `${process.env.NEXT_PUBLIC_APP_URL}/api/internal/pipeline/submissions/${submissionId}/process`,
+        `${appUrl}/api/internal/pipeline/submissions/${submissionId}/process`,
         {
           method: 'POST',
           headers: {

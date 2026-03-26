@@ -58,6 +58,27 @@ async function downloadPageBytes(ctx: WorkerContext, pageNumber: number): Promis
   return Buffer.from(arr)
 }
 
+function clampExtractBox(
+  x: number,
+  y: number,
+  w: number,
+  h: number,
+  imageWidth: number,
+  imageHeight: number
+) {
+  const rawLeft = Math.floor(x * imageWidth)
+  const rawTop = Math.floor(y * imageHeight)
+  const rawWidth = Math.floor(w * imageWidth)
+  const rawHeight = Math.floor(h * imageHeight)
+
+  const left = Math.max(0, Math.min(rawLeft, imageWidth - 1))
+  const top = Math.max(0, Math.min(rawTop, imageHeight - 1))
+  const width = Math.max(1, Math.min(rawWidth, imageWidth - left))
+  const height = Math.max(1, Math.min(rawHeight, imageHeight - top))
+
+  return { left, top, width, height, rawLeft, rawTop, rawWidth, rawHeight }
+}
+
 async function cropAndPreprocessRoi(
   ctx: WorkerContext,
   roi: RoiCrop
@@ -79,25 +100,69 @@ async function cropAndPreprocessRoi(
 
   if (roi.bbox_norm) {
     const [x, y, w, h] = roi.bbox_norm
-    const left = Math.max(0, Math.floor(x * info.width))
-    const top = Math.max(0, Math.floor(y * info.height))
-    const width = Math.max(1, Math.floor(w * info.width))
-    const height = Math.max(1, Math.floor(h * info.height))
 
-    cropped = img.extract({ left, top, width, height })
-    cropMeta = {
-      ...cropMeta,
-      left,
-      top,
-      width,
-      height,
+    console.log('[worker] ROI crop', {
+      roi_id: roi.roi_id,
+      page_number: roi.page_number,
+      bbox_norm: roi.bbox_norm,
       image_width: info.width,
       image_height: info.height,
+    })
+
+    if (
+      !Number.isFinite(x) ||
+      !Number.isFinite(y) ||
+      !Number.isFinite(w) ||
+      !Number.isFinite(h)
+    ) {
+      throw new Error(
+        `Invalid ROI bbox (non-finite): roi_id=${roi.roi_id}, page=${roi.page_number}, bbox=${JSON.stringify(
+          roi.bbox_norm
+        )}`
+      )
+    }
+
+    if (w <= 0 || h <= 0) {
+      throw new Error(
+        `Invalid ROI bbox (non-positive size): roi_id=${roi.roi_id}, page=${roi.page_number}, bbox=${JSON.stringify(
+          roi.bbox_norm
+        )}`
+      )
+    }
+
+    const box = clampExtractBox(x, y, w, h, info.width, info.height)
+
+    if (box.width <= 0 || box.height <= 0) {
+      throw new Error(
+        `Invalid ROI bbox after clamp: roi_id=${roi.roi_id}, page=${roi.page_number}, bbox=${JSON.stringify(
+          roi.bbox_norm
+        )}, clamped=${JSON.stringify(box)}, image=${info.width}x${info.height}`
+      )
+    }
+
+    cropped = img.extract({
+      left: box.left,
+      top: box.top,
+      width: box.width,
+      height: box.height,
+    })
+
+    cropMeta = {
+      ...cropMeta,
+      left: box.left,
+      top: box.top,
+      width: box.width,
+      height: box.height,
+      raw_left: box.rawLeft,
+      raw_top: box.rawTop,
+      raw_width: box.rawWidth,
+      raw_height: box.rawHeight,
+      image_width: info.width,
+      image_height: info.height,
+      bbox_norm: roi.bbox_norm,
     }
   }
 
-  // Preprocess before OCR
-  // grayscale + normalize + sharpen + threshold-like contrast
   const preprocessed = await cropped
     .grayscale()
     .normalize()
@@ -187,7 +252,6 @@ export async function runOcrEnsembleForRoi(
 
   const candidates: OcrRawCandidate[] = []
 
-  // OCR 1: Google Vision
   try {
     const g = await googleVisionOcr(png)
     candidates.push({
@@ -214,7 +278,6 @@ export async function runOcrEnsembleForRoi(
     })
   }
 
-  // OCR 2: PaddleOCR (Python service)
   try {
     const p = await paddleOcr(png)
     candidates.push({
