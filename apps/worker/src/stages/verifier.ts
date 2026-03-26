@@ -8,6 +8,13 @@ export type FinalDecision = {
   final_score: number
   selected_candidate_id: string | null
   evidence_map: Record<string, unknown>
+
+  review_required: boolean
+  ocr1_confidence: number
+  ocr2_confidence: number
+  math_score: number
+  final_confidence: number
+  decision: 'auto_graded' | 'needs_review'
 }
 
 export async function verifyRoiIfNeeded(
@@ -16,18 +23,27 @@ export async function verifyRoiIfNeeded(
   _candidates: PersistedCandidate[],
   grade: GradeDecision
 ): Promise<FinalDecision> {
-  // รอบแรกยังไม่เรียก verifier จริง
-  // ถ้าต้องการภายหลัง ค่อยเปิดเงื่อนไข low confidence / disagreement
+  const reviewRequired = grade.decision === 'needs_review'
 
   return {
     auto_score: grade.auto_score,
     final_score: grade.final_score,
     selected_candidate_id: grade.selected_candidate_id,
+    review_required: reviewRequired,
+    ocr1_confidence: grade.ocr1_confidence,
+    ocr2_confidence: grade.ocr2_confidence,
+    math_score: grade.math_score,
+    final_confidence: grade.final_confidence,
+    decision: grade.decision,
     evidence_map: {
       ...grade.evidence_map,
       verifier_used: false,
-      grade_reason: grade.reason,
-      grade_confidence: grade.confidence,
+      review_required: reviewRequired,
+      decision: grade.decision,
+      ocr1_confidence: grade.ocr1_confidence,
+      ocr2_confidence: grade.ocr2_confidence,
+      math_score: grade.math_score,
+      final_confidence: grade.final_confidence,
     },
   }
 }
