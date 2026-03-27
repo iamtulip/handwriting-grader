@@ -1,259 +1,372 @@
-import 'dotenv/config'
 import { supabase } from './lib/supabase'
-import { loadContext } from './stages/load_context'
-import { runAlignmentForPage } from './stages/alignment'
-import { cropRoisForPage } from './stages/roi_crop'
+import { loadContext, type WorkerContext } from './stages/load_context'
+import { cropRoisForPage, type RoiCrop } from './stages/roi_crop'
 import { runOcrEnsembleForRoi } from './stages/ocr_ensemble'
-import { persistCandidates } from './stages/candidate_persist'
-import { deterministicGradeRoi } from './stages/math_grade'
-import { verifyRoiIfNeeded } from './stages/verifier'
-import { finalizeSubmission } from './stages/finalize'
-import { setStage } from './utils/stage'
+import { persistCandidates, type PersistedCandidate } from './stages/candidate_persist'
+import { gradeMathAnswer } from './stages/math_grade'
+import { verifyAndFinalize } from './stages/verifier'
 
-const POLL_INTERVAL_MS = 3000
+const POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS ?? 5000)
 const PIPELINE_VERSION = 'v2'
 
-function getErrorMessage(error: unknown): string {
-  if (error instanceof Error) return error.message
+type SubmissionRow = {
+  id: string
+  status: string | null
+  current_stage: string | null
+  last_error: string | null
+}
 
-  if (typeof error === 'object' && error !== null) {
-    try {
-      return JSON.stringify(error)
-    } catch {
-      return String(error)
-    }
+function stringifyError(error: unknown): string {
+  if (error instanceof Error) return error.message
+  try {
+    return JSON.stringify(error)
+  } catch {
+    return String(error)
+  }
+}
+
+function resolveItemNo(roi: RoiCrop): string {
+  if (roi.item_no && String(roi.item_no).trim() !== '') {
+    return String(roi.item_no).trim()
   }
 
-  return String(error ?? 'Unknown worker error')
+  if (roi.question_no && String(roi.question_no).trim() !== '') {
+    return String(roi.question_no).trim()
+  }
+
+  return String(roi.roi_id)
+}
+
+function findAnswerKeyItem(ctx: WorkerContext, roi: RoiCrop): any | null {
+  const resolvedItemNo = resolveItemNo(roi)
+  const items = Array.isArray(ctx.answerKeyItems) ? ctx.answerKeyItems : []
+
+  const found =
+    items.find((item: any) => {
+      const itemNo =
+        item?.item_no ??
+        item?.question_no ??
+        item?.no ??
+        item?.id
+
+      return itemNo != null && String(itemNo).trim() === resolvedItemNo
+    }) ?? null
+
+  return found
+}
+
+async function markSubmissionStage(
+  submissionId: string,
+  stage: string,
+  patch?: Record<string, unknown>
+): Promise<void> {
+  const { error } = await supabase
+    .from('submissions')
+    .update({
+      current_stage: stage,
+      pipeline_version: PIPELINE_VERSION,
+      updated_at: new Date().toISOString(),
+      ...(patch ?? {}),
+    })
+    .eq('id', submissionId)
+
+  if (error) {
+    throw new Error(`Failed to update submission stage: ${error.message}`)
+  }
 }
 
 async function markSubmissionError(
   submissionId: string,
-  message: string,
-  status: 'needs_review' | 'uploaded' = 'needs_review'
-) {
+  errorMessage: string,
+  status = 'needs_review'
+): Promise<void> {
   const { error } = await supabase
     .from('submissions')
     .update({
-      current_stage: 'v2:error',
       status,
-      last_error: message,
+      current_stage: 'v2:error',
+      last_error: errorMessage,
+      pipeline_version: PIPELINE_VERSION,
       updated_at: new Date().toISOString(),
     })
     .eq('id', submissionId)
 
   if (error) {
-    console.error('[worker] failed to mark submission error', {
-      submissionId,
-      message,
-      error,
-    })
+    throw new Error(`Failed to mark submission error: ${error.message}`)
   }
 }
 
-async function lockNextJob(): Promise<string | null> {
-  const { data: jobs, error } = await supabase
+async function finalizeSubmission(
+  submissionId: string,
+  decision: 'auto_graded' | 'needs_review'
+): Promise<void> {
+  const nextStatus = decision === 'auto_graded' ? 'graded' : 'needs_review'
+
+  const { error } = await supabase
     .from('submissions')
-    .select(`
-      id,
-      updated_at,
-      submission_files!inner (
-        id
-      )
-    `)
-    .eq('pipeline_version', PIPELINE_VERSION)
-    .in('current_stage', ['pending', 'v2:queued'])
-    .order('updated_at', { ascending: false })
+    .update({
+      status: nextStatus,
+      current_stage: 'v2:done',
+      last_error: null,
+      pipeline_version: PIPELINE_VERSION,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', submissionId)
+
+  if (error) {
+    throw new Error(`Failed to finalize submission: ${error.message}`)
+  }
+}
+
+async function lockNextSubmission(): Promise<SubmissionRow | null> {
+  const candidateStatuses = [
+    'uploaded',
+    'ocr_pending',
+    'extract_pending',
+    'grade_pending',
+  ]
+
+  const { data, error } = await supabase
+    .from('submissions')
+    .select('id, status, current_stage, last_error')
+    .in('status', candidateStatuses)
+    .or('current_stage.is.null,current_stage.neq.v2:locked')
+    .order('updated_at', { ascending: true })
     .limit(1)
 
   if (error) {
-    console.error('[worker] failed to poll jobs', error)
-    return null
+    throw new Error(`Failed to fetch next submission: ${error.message}`)
   }
 
-  if (!jobs || jobs.length === 0) {
-    return null
-  }
+  const row = (data ?? [])[0] as SubmissionRow | undefined
+  if (!row) return null
 
-  const submissionId = jobs[0].id as string
-
-  const { data: locked, error: lockError } = await supabase
+  const { data: updated, error: updateError } = await supabase
     .from('submissions')
     .update({
-      current_stage: 'v2:queued',
-      last_error: null,
+      status: 'processing',
+      current_stage: 'v2:locked',
+      pipeline_version: PIPELINE_VERSION,
       updated_at: new Date().toISOString(),
     })
-    .eq('id', submissionId)
-    .in('current_stage', ['pending', 'v2:queued'])
-    .select('id')
-    .maybeSingle()
+    .eq('id', row.id)
+    .neq('current_stage', 'v2:locked')
+    .select('id, status, current_stage, last_error')
+    .single()
 
-  if (lockError || !locked) {
+  if (updateError || !updated) {
     return null
   }
 
-  return submissionId
+  console.log('[worker] locked submission', {
+    submissionId: updated.id,
+    status: updated.status,
+    current_stage: updated.current_stage,
+  })
+
+  return updated as SubmissionRow
 }
 
-async function cleanupBrokenQueuedSubmissions() {
-  const { data: broken, error } = await supabase
-    .from('submissions')
-    .select('id')
-    .eq('pipeline_version', PIPELINE_VERSION)
-    .in('current_stage', ['pending', 'v2:queued'])
+async function processSingleRoi(
+  ctx: WorkerContext,
+  roi: RoiCrop
+): Promise<'auto_graded' | 'needs_review'> {
+  const submissionId = ctx.submission.id
+  const pageNo = Number(roi.page_number)
+  const resolvedItemNo = resolveItemNo(roi)
 
-  if (error || !broken || broken.length === 0) {
-    return
+  console.log('[worker] process ROI start', {
+    submissionId,
+    roi_id: roi.roi_id,
+    pageNo,
+    item_no: resolvedItemNo,
+  })
+
+  const ocrResult = await runOcrEnsembleForRoi(ctx, roi)
+
+  const dbCandidates: PersistedCandidate[] = await persistCandidates(
+    ctx,
+    roi,
+    ocrResult.candidates
+  )
+
+  const answerKeyItem = findAnswerKeyItem(ctx, roi)
+
+  const grade = await gradeMathAnswer({
+    ctx,
+    roi,
+    candidates: dbCandidates,
+    answerKeyItem,
+  })
+
+  const final = await verifyAndFinalize({
+    ctx,
+    roi,
+    candidates: dbCandidates,
+    grade,
+    answerKeyItem,
+  })
+
+  console.log('[worker] verifier result', {
+    submissionId,
+    roi_id: roi.roi_id,
+    item_no: resolvedItemNo,
+    alpha: final.alpha,
+    beta: final.beta,
+    gamma: final.gamma,
+    final_confidence: final.final_confidence,
+    threshold: final.threshold,
+    decision: final.decision,
+    selected_candidate_text: final.selected_candidate_text ?? null,
+    selected_candidate_normalized: final.selected_candidate_normalized ?? null,
+    verifier_used: final.verifier_used,
+    review_required: final.review_required,
+  })
+
+  const { error } = await supabase
+    .from('grading_results')
+    .upsert(
+      {
+        submission_id: submissionId,
+        item_no: resolvedItemNo,
+        roi_id: roi.roi_id,
+        page_number: pageNo,
+        layout_spec_version: ctx.layoutSpec.version,
+        auto_score: final.auto_score,
+        final_score: final.final_score,
+        selected_candidate_id: final.selected_candidate_id,
+        evidence_map: final.evidence_map ?? null,
+        is_human_override: false,
+        confidence_score: final.final_confidence ?? null,
+        debug_payload: {
+          roi_id: roi.roi_id,
+          page_number: pageNo,
+          bbox_norm: roi.bbox_norm ?? null,
+          question_no: roi.question_no ?? null,
+          item_no: roi.item_no ?? null,
+          answer_type: roi.answer_type ?? null,
+          score_weight: roi.score_weight ?? null,
+          debug_roi_path: ocrResult.debug?.debug_roi_path ?? null,
+          google_raw_by_variant: ocrResult.debug?.google_raw_by_variant ?? [],
+          paddle_raw_by_variant: ocrResult.debug?.paddle_raw_by_variant ?? [],
+          merged_candidates: ocrResult.debug?.merged_candidates ?? [],
+          persisted_candidates: dbCandidates ?? [],
+          grade,
+          final,
+        },
+        updated_at: new Date().toISOString(),
+      },
+      {
+        onConflict: 'submission_id,item_no',
+      }
+    )
+
+  if (error) {
+    throw new Error(`Failed to upsert grading_results: ${error.message}`)
   }
 
-  for (const row of broken) {
-    const submissionId = row.id as string
+  console.log('[worker] grading_results upserted', {
+    submissionId,
+    pageNo,
+    roi_id: roi.roi_id,
+    item_no: resolvedItemNo,
+  })
 
-    const { data: files, error: fileError } = await supabase
-      .from('submission_files')
-      .select('id')
-      .eq('submission_id', submissionId)
-      .limit(1)
-
-    if (fileError) {
-      console.error('[worker] failed to inspect submission_files', {
-        submissionId,
-        fileError,
-      })
-      continue
-    }
-
-    if (!files || files.length === 0) {
-      await markSubmissionError(
-        submissionId,
-        'No submission_files attached to this submission',
-        'needs_review'
-      )
-    }
-  }
+  return final.decision === 'auto_graded' ? 'auto_graded' : 'needs_review'
 }
 
-export async function pollAndProcessV2() {
+export async function processSubmissionV2(submissionId: string): Promise<void> {
+  console.log('[worker] processSubmissionV2 start', { submissionId })
+
   try {
-    await cleanupBrokenQueuedSubmissions()
+    await markSubmissionStage(submissionId, 'v2:load_context')
 
-    const submissionId = await lockNextJob()
-    if (!submissionId) return
-
-    await processSubmissionV2(submissionId)
-  } catch (error) {
-    console.error('[worker] pollAndProcessV2 error', error)
-  }
-}
-
-export async function processSubmissionV2(submissionId: string) {
-  try {
-    await setStage(submissionId, 'v2:loading_context')
     const ctx = await loadContext(submissionId)
 
-    if (!ctx.pages || ctx.pages.length === 0) {
-      throw new Error('Submission files not found')
-    }
-
-    for (const pageFile of ctx.pages) {
-      const pageNo = pageFile.page_number
-
-      await setStage(submissionId, `v2:aligning:p${pageNo}`)
-      const alignment = await runAlignmentForPage(ctx, pageFile)
-
-      await setStage(submissionId, `v2:cropping:p${pageNo}`)
-      const roiCrops = await cropRoisForPage(ctx, pageNo, alignment)
-
-      if (!roiCrops || roiCrops.length === 0) {
-        console.warn('[worker] no ROI crops found for page', {
-          submissionId,
-          pageNo,
-        })
-        continue
-      }
-
-      for (const roi of roiCrops) {
-        await setStage(submissionId, `v2:ocr:p${pageNo}:roi:${roi.roi_id}`)
-        const rawCandidates = await runOcrEnsembleForRoi(ctx, roi)
-
-        await setStage(submissionId, `v2:candidates:p${pageNo}:roi:${roi.roi_id}`)
-        const dbCandidates = await persistCandidates(ctx, roi, rawCandidates)
-
-        await setStage(submissionId, `v2:grading:p${pageNo}:roi:${roi.roi_id}`)
-        const grade = await deterministicGradeRoi(ctx, roi, dbCandidates)
-
-        await setStage(submissionId, `v2:verify:p${pageNo}:roi:${roi.roi_id}`)
-        const final = await verifyRoiIfNeeded(ctx, roi, dbCandidates, grade)
-
-        const resolvedItemNo =
-          roi.item_no ??
-          (roi.region?.item_no != null ? String(roi.region.item_no) : null) ??
-          (roi.region?.question_no != null ? String(roi.region.question_no) : null) ??
-          String(roi.roi_id)
-
-        if (!roi.item_no) {
-          console.warn('[worker] roi.item_no missing, fallback used', {
-            submissionId,
-            roi_id: roi.roi_id,
-            page_number: pageNo,
-            kind: roi.kind,
-            resolvedItemNo,
-          })
-        }
-
-        const { error } = await supabase.from('grading_results').upsert(
-          {
-            submission_id: submissionId,
-            item_no: resolvedItemNo,
-            roi_id: roi.roi_id,
-            page_number: pageNo,
-            layout_spec_version: ctx.layoutSpec.version,
-            auto_score: final.auto_score,
-            final_score: final.final_score,
-            selected_candidate_id: final.selected_candidate_id,
-            evidence_map: final.evidence_map ?? null,
-            is_human_override: false,
-            confidence_score: final.final_confidence ?? null,
-          },
-          { onConflict: 'submission_id,roi_id,page_number,layout_spec_version' as any }
-        )
-
-        if (error) {
-          throw error
-        }
-      }
-    }
-
-    await finalizeSubmission(ctx)
-    await setStage(submissionId, 'v2:done')
-
-    const { error: clearError } = await supabase
-      .from('submissions')
-      .update({
-        last_error: null,
-        updated_at: new Date().toISOString(),
+    if (
+      ctx.submission.status === 'graded' ||
+      ctx.submission.status === 'needs_review' ||
+      ctx.submission.current_stage === 'v2:done'
+    ) {
+      console.log('[worker] skip already completed submission', {
+        submissionId: ctx.submission.id,
+        status: ctx.submission.status,
+        current_stage: ctx.submission.current_stage,
       })
-      .eq('id', submissionId)
-
-    if (clearError) {
-      console.error('[worker] failed to clear last_error', clearError)
-    }
-  } catch (error) {
-    const message = getErrorMessage(error)
-
-    console.error(`[worker] processSubmissionV2 failed for ${submissionId}`, error)
-    console.error('[worker] full error object:', error)
-
-    if (message.includes('Submission files not found')) {
-      await markSubmissionError(submissionId, message, 'needs_review')
       return
     }
+
+    console.log('[worker] context loaded', {
+      submissionId: ctx.submission.id,
+      pages: ctx.pages.map((p: any) => ({
+        page_number: p.page_number,
+        storage_path: p.storage_path,
+      })),
+      layoutVersion: ctx.layoutSpec.version,
+      answerKeyItems: Array.isArray(ctx.answerKeyItems) ? ctx.answerKeyItems.length : 0,
+    })
+
+    let overallDecision: 'auto_graded' | 'needs_review' = 'auto_graded'
+
+    const pages = Array.isArray(ctx.pages) ? ctx.pages : []
+
+    for (const page of pages) {
+      const pageNumber = Number(page.page_number ?? 1)
+
+      await markSubmissionStage(submissionId, `v2:roi_crop:page_${pageNumber}`)
+
+      const rois = await cropRoisForPage(ctx, pageNumber, null)
+
+      console.log('[worker] page ROIs', {
+        submissionId,
+        pageNo: pageNumber,
+        count: rois.length,
+      })
+
+      for (const roi of rois) {
+        await markSubmissionStage(
+          submissionId,
+          `v2:ocr:item_${roi.item_no ?? roi.question_no ?? roi.roi_id}`
+        )
+
+        const decision = await processSingleRoi(ctx, roi)
+
+        if (decision === 'needs_review') {
+          overallDecision = 'needs_review'
+        }
+      }
+    }
+
+    console.log('[worker] finalize start', { submissionId })
+
+    await finalizeSubmission(submissionId, overallDecision)
+
+    console.log('[worker] processSubmissionV2 done', { submissionId })
+  } catch (error) {
+    const message = stringifyError(error)
+
+    console.error('[worker] processSubmissionV2 failed', {
+      submissionId,
+      error: message,
+    })
 
     await markSubmissionError(submissionId, message, 'needs_review')
     throw error
   }
 }
+
+async function pollAndProcessV2(): Promise<void> {
+  try {
+    const locked = await lockNextSubmission()
+    if (!locked) return
+
+    await processSubmissionV2(locked.id)
+  } catch (error) {
+    console.error('[worker] pollAndProcessV2 error', error)
+  }
+}
+
+void pollAndProcessV2()
 
 setInterval(() => {
   void pollAndProcessV2()

@@ -1,288 +1,196 @@
-import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+//apps/web/app/api/student/assignments/[assignmentId]/submit/route.ts
+import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@supabase/supabase-js'
+import { randomUUID } from 'crypto'
 
-export const runtime = 'nodejs'
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!
+const BUCKET = process.env.SUBMISSION_FILES_BUCKET || 'submission-files'
 
-const BUCKET = 'submission-files'
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-function getSafeExtension(fileName: string, mimeType?: string) {
-  const extFromName = fileName.includes('.')
-    ? fileName.split('.').pop()?.toLowerCase() ?? ''
-    : ''
-
-  const allowed = new Set([
-    'jpg',
-    'jpeg',
-    'png',
-    'webp',
-    'pdf',
-    'heic',
-    'heif',
-  ])
-
-  if (allowed.has(extFromName)) return extFromName
-
-  const mime = (mimeType || '').toLowerCase()
-  if (mime.includes('jpeg')) return 'jpg'
-  if (mime.includes('png')) return 'png'
-  if (mime.includes('webp')) return 'webp'
-  if (mime.includes('pdf')) return 'pdf'
-  if (mime.includes('heic')) return 'heic'
-  if (mime.includes('heif')) return 'heif'
-
-  return 'bin'
+function badRequest(message: string, status = 400) {
+  return NextResponse.json({ error: message }, { status })
 }
 
-function buildSafeStoragePath(
-  assignmentId: string,
-  userId: string,
-  submissionId: string,
-  pageNumber: number,
-  fileName: string,
-  mimeType?: string
-) {
-  const ext = getSafeExtension(fileName, mimeType)
-  const unique = crypto.randomUUID()
-  return `${assignmentId}/${userId}/${submissionId}/page-${pageNumber}-${Date.now()}-${unique}.${ext}`
-}
-
-async function canStudentAccessAssignment(
-  supabase: any,
-  userId: string,
-  assignmentId: string
-) {
-  const { data: assignment } = await supabase
-    .from('assignments')
-    .select('id, section_id, open_at, due_at, close_at, title')
-    .eq('id', assignmentId)
-    .maybeSingle()
-
-  if (!assignment) {
-    return { allowed: false, assignment: null }
-  }
-
-  const { data: membership } = await supabase
-    .from('student_sections')
-    .select('id')
-    .eq('student_id', userId)
-    .eq('section_id', assignment.section_id)
-    .maybeSingle()
-
-  return {
-    allowed: !!membership,
-    assignment,
-  }
+function sanitizeFilename(name: string): string {
+  return name.replace(/[^\w.\-]+/g, '_')
 }
 
 export async function POST(
-  req: Request,
-  context: { params: Promise<{ assignmentId: string }> }
+  req: NextRequest,
+  { params }: { params: Promise<{ assignmentId: string }> }
 ) {
-  const { assignmentId } = await context.params
-  const supabase = await createClient()
+  try {
+    const { assignmentId } = await params
 
-  const {
-    data: { user },
-    error: authError,
-  } = await supabase.auth.getUser()
+    const formData = await req.formData()
+    const studentId = String(formData.get('studentId') ?? '').trim()
+    const files = formData
+      .getAll('files')
+      .filter((f): f is File => f instanceof File && f.size > 0)
 
-  if (authError || !user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
+    if (!assignmentId) {
+      return badRequest('Missing assignmentId')
+    }
 
-  const { data: me, error: meError } = await supabase
-    .from('user_profiles')
-    .select('id, role')
-    .eq('id', user.id)
-    .maybeSingle()
+    if (!studentId) {
+      return badRequest('Missing studentId')
+    }
 
-  if (meError) {
-    return NextResponse.json({ error: meError.message }, { status: 500 })
-  }
+    if (files.length === 0) {
+      return badRequest('No files uploaded')
+    }
 
-  if ((me?.role ?? 'student') !== 'student') {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
+    // 1) หา submission เดิม
+    let submissionId: string
 
-  const access = await canStudentAccessAssignment(supabase, user.id, assignmentId)
-  if (!access.allowed || !access.assignment) {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
+    const { data: existingSubmission, error: submissionLookupError } = await supabase
+      .from('submissions')
+      .select('id, status, current_stage')
+      .eq('assignment_id', assignmentId)
+      .eq('student_id', studentId)
+      .maybeSingle()
 
-  const now = new Date()
-  const openAt = access.assignment.open_at ? new Date(access.assignment.open_at) : null
-  const closeAt = access.assignment.close_at ? new Date(access.assignment.close_at) : null
+    if (submissionLookupError) {
+      return badRequest(`Failed to lookup submission: ${submissionLookupError.message}`, 500)
+    }
 
-  if (openAt && now < openAt) {
-    return NextResponse.json({ error: 'Assignment is not open yet' }, { status: 400 })
-  }
+    if (existingSubmission) {
+      submissionId = existingSubmission.id
+    } else {
+      const { data: insertedSubmission, error: insertSubmissionError } = await supabase
+        .from('submissions')
+        .insert({
+          assignment_id: assignmentId,
+          student_id: studentId,
+          status: 'uploaded',
+          current_stage: null,
+          pipeline_version: 'v2',
+        })
+        .select('id')
+        .single()
 
-  if (closeAt && now > closeAt) {
-    return NextResponse.json({ error: 'Assignment is already closed' }, { status: 400 })
-  }
+      if (insertSubmissionError || !insertedSubmission) {
+        return badRequest(
+          `Failed to create submission: ${insertSubmissionError?.message ?? 'unknown error'}`,
+          500
+        )
+      }
 
-  const formData = await req.formData()
-  const files = formData.getAll('files')
+      submissionId = insertedSubmission.id
+    }
 
-  if (!files.length) {
-    return NextResponse.json({ error: 'At least one file is required' }, { status: 400 })
-  }
-
-  const normalizedFiles = files.filter((f): f is File => f instanceof File)
-  if (normalizedFiles.length === 0) {
-    return NextResponse.json({ error: 'Invalid files' }, { status: 400 })
-  }
-
-  let submissionId: string | null = null
-
-  const { data: existingSubmission, error: existingSubmissionError } = await supabase
-    .from('submissions')
-    .select('id')
-    .eq('assignment_id', assignmentId)
-    .eq('student_id', user.id)
-    .maybeSingle()
-
-  if (existingSubmissionError) {
-    return NextResponse.json({ error: existingSubmissionError.message }, { status: 500 })
-  }
-
-  if (existingSubmission?.id) {
-    submissionId = existingSubmission.id
-
-    const { data: oldFiles } = await supabase
+    // 2) ดึงไฟล์เดิมออกมาก่อน เผื่อลบจาก storage
+    const { data: oldFiles, error: oldFilesError } = await supabase
       .from('submission_files')
       .select('id, storage_path')
       .eq('submission_id', submissionId)
 
-    const oldPaths = (oldFiles ?? [])
-      .map((x: any) => x.storage_path)
-      .filter(Boolean)
-
-    if (oldPaths.length > 0) {
-      await supabase.storage.from(BUCKET).remove(oldPaths)
+    if (oldFilesError) {
+      return badRequest(`Failed to fetch existing submission files: ${oldFilesError.message}`, 500)
     }
 
-    await supabase
+    // 3) ลบ row เดิมใน submission_files ก่อน
+    const { error: deleteOldFileRowsError } = await supabase
       .from('submission_files')
       .delete()
       .eq('submission_id', submissionId)
 
-    await supabase
-      .from('submissions')
-      .update({
-        status: 'uploaded',
-        submitted_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        current_stage: 'pending',
-        pipeline_version: 'v2',
-        fraud_flag: false,
-        extracted_paper_student_id: null,
-      })
-      .eq('id', submissionId)
-  } else {
-    const { data: createdSubmission, error: createSubmissionError } = await supabase
-      .from('submissions')
-      .insert({
-        assignment_id: assignmentId,
-        student_id: user.id,
-        status: 'uploaded',
-        submitted_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        current_stage: 'pending',
-        pipeline_version: 'v2',
-      })
-      .select('id')
-      .single()
-
-    if (createSubmissionError) {
-      return NextResponse.json({ error: createSubmissionError.message }, { status: 500 })
+    if (deleteOldFileRowsError) {
+      return badRequest(
+        `Failed to delete old submission_files: ${deleteOldFileRowsError.message}`,
+        500
+      )
     }
 
-    submissionId = createdSubmission.id
-  }
+    // 4) ลบไฟล์เก่าใน storage
+    if (Array.isArray(oldFiles) && oldFiles.length > 0) {
+      const paths = oldFiles
+        .map((f) => f.storage_path)
+        .filter((p): p is string => typeof p === 'string' && p.length > 0)
 
-  if (!submissionId) {
-    return NextResponse.json({ error: 'Failed to create submission' }, { status: 500 })
-  }
+      if (paths.length > 0) {
+        const { error: removeStorageError } = await supabase.storage
+          .from(BUCKET)
+          .remove(paths)
 
-  const insertedFiles: any[] = []
-  const uploadedPaths: string[] = []
-
-  for (let i = 0; i < normalizedFiles.length; i += 1) {
-    const file = normalizedFiles[i]
-    const pageNumber = i + 1
-    const storagePath = buildSafeStoragePath(
-      assignmentId,
-      user.id,
-      submissionId,
-      pageNumber,
-      file.name,
-      file.type
-    )
-
-    const arrayBuffer = await file.arrayBuffer()
-    const buffer = Buffer.from(arrayBuffer)
-
-    const { error: uploadError } = await supabase.storage
-      .from(BUCKET)
-      .upload(storagePath, buffer, {
-        contentType: file.type || 'application/octet-stream',
-        upsert: false,
-      })
-
-    if (uploadError) {
-      if (uploadedPaths.length > 0) {
-        await supabase.storage.from(BUCKET).remove(uploadedPaths)
+        if (removeStorageError) {
+          console.warn('[submit] failed to remove old storage files', removeStorageError.message)
+        }
       }
-      return NextResponse.json({ error: uploadError.message }, { status: 500 })
     }
 
-    uploadedPaths.push(storagePath)
+    // 5) อัปโหลดไฟล์ใหม่และ insert submission_files
+    const insertedFileRows: Array<{
+      id: string
+      submission_id: string
+      page_number: number
+      storage_path: string
+      mime_type: string
+    }> = []
 
-    const { data: fileRow, error: insertFileError } = await supabase
-      .from('submission_files')
-      .insert({
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i]
+      const pageNumber = i + 1
+      const ext = file.name.includes('.') ? file.name.split('.').pop() : 'jpg'
+      const safeName = sanitizeFilename(file.name)
+      const objectId = randomUUID()
+      const storagePath =
+        `${assignmentId}/${studentId}/${submissionId}/` +
+        `page-${pageNumber}-${objectId}-${safeName}`
+
+      const arrayBuffer = await file.arrayBuffer()
+      const buffer = Buffer.from(arrayBuffer)
+
+      const { error: uploadError } = await supabase.storage
+        .from(BUCKET)
+        .upload(storagePath, buffer, {
+          contentType: file.type || 'application/octet-stream',
+          upsert: true,
+        })
+
+      if (uploadError) {
+        return badRequest(`Failed to upload file: ${uploadError.message}`, 500)
+      }
+
+      insertedFileRows.push({
+        id: randomUUID(),
         submission_id: submissionId,
         page_number: pageNumber,
         storage_path: storagePath,
+        mime_type: file.type || `image/${ext}`,
       })
-      .select(`
-        id,
-        submission_id,
-        page_number,
-        storage_path,
-        created_at
-      `)
-      .single()
-
-    if (insertFileError) {
-      await supabase.storage.from(BUCKET).remove([storagePath])
-      return NextResponse.json({ error: insertFileError.message }, { status: 500 })
     }
 
-    insertedFiles.push(fileRow)
-  }
+    const { error: insertSubmissionFilesError } = await supabase
+      .from('submission_files')
+      .insert(insertedFileRows)
 
-  try {
-    const appUrl = process.env.NEXT_PUBLIC_APP_URL
-    if (process.env.PIPELINE_SECRET && appUrl) {
-      await fetch(
-        `${appUrl}/api/internal/pipeline/submissions/${submissionId}/process`,
-        {
-          method: 'POST',
-          headers: {
-            'x-pipeline-secret': process.env.PIPELINE_SECRET,
-          },
-        }
+    if (insertSubmissionFilesError) {
+      return badRequest(
+        `Failed to insert submission_files: ${insertSubmissionFilesError.message}`,
+        500
       )
     }
-  } catch {
-    // intentionally swallow; submission is already saved
-  }
 
-  return NextResponse.json({
-    ok: true,
-    submission_id: submissionId,
-    files: insertedFiles,
-  })
+    // 6) reset submission for regrade
+    const { error: resetError } = await supabase.rpc('reset_submission_for_regrade', {
+      p_submission_id: submissionId,
+    })
+
+    if (resetError) {
+      return badRequest(`Failed to reset submission for regrade: ${resetError.message}`, 500)
+    }
+
+    return NextResponse.json({
+      ok: true,
+      submissionId,
+      fileCount: insertedFileRows.length,
+      message: 'Submission uploaded and queued for regrade',
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return NextResponse.json({ error: message }, { status: 500 })
+  }
 }

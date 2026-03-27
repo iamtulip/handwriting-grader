@@ -46,3 +46,15 @@ node_modules/
 dist
 .env*
 
+*.json
+# หรือระบุเจาะจงไปเลย
+vision-key.json
+vision-key.json.json
+# ประเด็นเรื่องไฟล์ JSON คีย์
+vision-key.json
+vision-key.json.json
+apps/vision-key.json.json
+
+# ไฟล์ Environment
+.env
+.env.local

@@ -1,49 +1,94 @@
-import type { WorkerContext } from './load_context'
+import type { WorkerContext, WorkerAnswerKeyItem } from './load_context'
 import type { RoiCrop } from './roi_crop'
 import type { PersistedCandidate } from './candidate_persist'
-import type { GradeDecision } from './math_grade'
+import type { GradeMathAnswerResult } from './math_grade'
 
-export type FinalDecision = {
-  auto_score: number
-  final_score: number
-  selected_candidate_id: string | null
-  evidence_map: Record<string, unknown>
-
-  review_required: boolean
-  ocr1_confidence: number
-  ocr2_confidence: number
-  math_score: number
-  final_confidence: number
-  decision: 'auto_graded' | 'needs_review'
+type VerifyAndFinalizeArgs = {
+  ctx: WorkerContext
+  roi: RoiCrop
+  candidates: PersistedCandidate[]
+  grade: GradeMathAnswerResult
+  answerKeyItem: WorkerAnswerKeyItem | null
 }
 
-export async function verifyRoiIfNeeded(
-  _ctx: WorkerContext,
-  _roi: RoiCrop,
-  _candidates: PersistedCandidate[],
-  grade: GradeDecision
-): Promise<FinalDecision> {
-  const reviewRequired = grade.decision === 'needs_review'
+export type VerifyAndFinalizeResult = {
+  alpha: number
+  beta: number
+  gamma: number
+  final_confidence: number
+  threshold: number
+  decision: 'auto_graded' | 'needs_review'
+  selected_candidate_text: string | null
+  selected_candidate_normalized: string | null
+  selected_candidate_id: string | null
+  verifier_used: boolean
+  review_required: boolean
+  auto_score: number
+  final_score: number
+  evidence_map: any
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0
+  return Math.max(0, Math.min(1, value))
+}
+
+function bestCandidateConfidence(candidates: PersistedCandidate[]): number {
+  if (!Array.isArray(candidates) || candidates.length === 0) return 0
+  return clamp01(Number(candidates[0]?.confidence_score ?? 0))
+}
+
+function deterministicScore(grade: GradeMathAnswerResult): number {
+  return clamp01(Number(grade?.match_score ?? 0))
+}
+
+function binaryMatchedScore(grade: GradeMathAnswerResult): number {
+  return grade?.matched ? 1 : 0
+}
+
+export async function verifyAndFinalize({
+  ctx: _ctx,
+  roi: _roi,
+  candidates,
+  grade,
+  answerKeyItem: _answerKeyItem,
+}: VerifyAndFinalizeArgs): Promise<VerifyAndFinalizeResult> {
+  const alpha = 0.35
+  const beta = 0.35
+  const gamma = 0.3
+
+  const c1 = deterministicScore(grade)
+  const c2 = bestCandidateConfidence(candidates)
+  const m = binaryMatchedScore(grade)
+
+  const final_confidence = clamp01(alpha * c1 + beta * c2 + gamma * m)
+  const threshold = 0.9
+
+  const decision: 'auto_graded' | 'needs_review' =
+    final_confidence >= threshold ? 'auto_graded' : 'needs_review'
+
+  const best = Array.isArray(candidates) && candidates.length > 0 ? candidates[0] : null
 
   return {
-    auto_score: grade.auto_score,
-    final_score: grade.final_score,
-    selected_candidate_id: grade.selected_candidate_id,
-    review_required: reviewRequired,
-    ocr1_confidence: grade.ocr1_confidence,
-    ocr2_confidence: grade.ocr2_confidence,
-    math_score: grade.math_score,
-    final_confidence: grade.final_confidence,
-    decision: grade.decision,
+    alpha,
+    beta,
+    gamma,
+    final_confidence,
+    threshold,
+    decision,
+    selected_candidate_text: best?.raw_text ?? grade?.selected_candidate_text ?? null,
+    selected_candidate_normalized:
+      best?.normalized_value ?? grade?.selected_candidate_normalized ?? null,
+    selected_candidate_id: best?.id ?? grade?.selected_candidate_id ?? null,
+    verifier_used: true,
+    review_required: decision === 'needs_review',
+    auto_score: Number(grade?.auto_score ?? 0),
+    final_score: Number(grade?.auto_score ?? 0),
     evidence_map: {
-      ...grade.evidence_map,
-      verifier_used: false,
-      review_required: reviewRequired,
-      decision: grade.decision,
-      ocr1_confidence: grade.ocr1_confidence,
-      ocr2_confidence: grade.ocr2_confidence,
-      math_score: grade.math_score,
-      final_confidence: grade.final_confidence,
+      c1,
+      c2,
+      m,
+      formula: 'C = alpha*c1 + beta*c2 + gamma*m',
     },
   }
 }

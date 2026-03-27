@@ -2,205 +2,450 @@ import type { WorkerContext, WorkerAnswerKeyItem } from './load_context'
 import type { RoiCrop } from './roi_crop'
 import type { PersistedCandidate } from './candidate_persist'
 
-export type GradeDecision = {
-  matched: boolean
+type GradeMathAnswerArgs = {
+  ctx: WorkerContext
+  roi: RoiCrop
+  candidates: PersistedCandidate[]
+  answerKeyItem: WorkerAnswerKeyItem | null
+}
+
+export type GradeMathAnswerResult = {
   auto_score: number
-  final_score: number
-  selected_candidate_id: string | null
-  evidence_map: Record<string, unknown>
-  confidence: number
+  match_score: number
+  matched: boolean
   reason: string
-
-  ocr1_confidence: number
-  ocr2_confidence: number
-  math_score: number
-  final_confidence: number
-  decision: 'auto_graded' | 'needs_review'
+  selected_candidate_id: string | null
+  selected_candidate_text: string | null
+  selected_candidate_normalized: string | null
+  expected_answer: string | null
+  expected_type: string | null
 }
 
-function clamp01(x: number) {
-  if (!Number.isFinite(x)) return 0
-  if (x < 0) return 0
-  if (x > 1) return 1
-  return x
+type ParsedValue =
+  | {
+      kind: 'number'
+      raw: string
+      normalized: string
+      numeric: number
+      unit: string | null
+    }
+  | {
+      kind: 'fraction'
+      raw: string
+      normalized: string
+      numeric: number
+      unit: string | null
+    }
+  | {
+      kind: 'percent'
+      raw: string
+      normalized: string
+      numeric: number
+      unit: string | null
+    }
+  | {
+      kind: 'string'
+      raw: string
+      normalized: string
+      unit: string | null
+    }
+
+const THB_UNIT_ALIASES = new Set(['บาท', '฿', 'บ.', 'บ', 'thb', 'baht', 'bath'])
+const METER_UNIT_ALIASES = new Set(['เมตร', 'ม.', 'ม', 'm', 'meter', 'meters'])
+const CM_UNIT_ALIASES = new Set(['เซนติเมตร', 'ซม.', 'ซม', 'cm', 'centimeter', 'centimeters'])
+const KG_UNIT_ALIASES = new Set(['กิโลกรัม', 'กก.', 'กก', 'kg', 'kilogram', 'kilograms'])
+const G_UNIT_ALIASES = new Set(['กรัม', 'กร.', 'กร', 'g', 'gram', 'grams'])
+
+function asText(value: unknown): string {
+  return String(value ?? '').trim()
 }
 
-function normalizeString(value: unknown): string {
-  return String(value ?? '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase()
+function asNullableText(value: unknown): string | null {
+  const s = asText(value)
+  return s.length > 0 ? s : null
 }
 
-function tryParseNumber(value: unknown): number | null {
-  const s = String(value ?? '')
+function normalizeWhitespace(value: string): string {
+  return value.replace(/\s+/g, ' ').trim()
+}
+
+function normalizeBasicText(value: unknown): string {
+  return asText(value)
+    .replace(/\r/g, ' ')
+    .replace(/\n/g, ' ')
     .replace(/\s+/g, '')
-    .replace(/,/g, '')
-  const n = Number(s)
+    .replace(/[，,]/g, '')
+    .replace(/[−–—]/g, '-')
+    .replace(/^\+/, '')
+    .trim()
+}
+
+function normalizeLeadingNoise(value: string): string {
+  return value.replace(/^[=~≈:\s]+/, '').trim()
+}
+
+function normalizeUnitToken(value: string): string {
+  const s = value.toLowerCase().trim()
+
+  if (THB_UNIT_ALIASES.has(s)) return 'thb'
+  if (METER_UNIT_ALIASES.has(s)) return 'm'
+  if (CM_UNIT_ALIASES.has(s)) return 'cm'
+  if (KG_UNIT_ALIASES.has(s)) return 'kg'
+  if (G_UNIT_ALIASES.has(s)) return 'g'
+
+  return s
+}
+
+function detectUnit(value: string): string | null {
+  const raw = normalizeWhitespace(String(value ?? '')).toLowerCase()
+
+  const unitPatterns: Array<[RegExp, string]> = [
+    [/(บาท|฿|\bthb\b|\bbaht\b|\bbath\b)/i, 'thb'],
+    [/(เซนติเมตร|\bcm\b|ซม\.?|centimeter|centimeters)/i, 'cm'],
+    [/(เมตร|\bm\b|ม\.?|meter|meters)/i, 'm'],
+    [/(กิโลกรัม|\bkg\b|กก\.?|kilogram|kilograms)/i, 'kg'],
+    [/(กรัม|\bg\b|กร\.?|gram|grams)/i, 'g'],
+  ]
+
+  for (const [pattern, unit] of unitPatterns) {
+    if (pattern.test(raw)) return unit
+  }
+
+  return null
+}
+
+function removeKnownUnits(value: string): string {
+  return normalizeWhitespace(value)
+    .replace(/บาท|฿|\bthb\b|\bbaht\b|\bbath\b/gi, '')
+    .replace(/เซนติเมตร|\bcm\b|ซม\.?|centimeter|centimeters/gi, '')
+    .replace(/เมตร|\bm\b|ม\.?|meter|meters/gi, '')
+    .replace(/กิโลกรัม|\bkg\b|กก\.?|kilogram|kilograms/gi, '')
+    .replace(/กรัม|\bg\b|กร\.?|gram|grams/gi, '')
+    .trim()
+}
+
+function parseNumericText(value: string): number | null {
+  const s = normalizeBasicText(normalizeLeadingNoise(removeKnownUnits(value)))
+
+  if (!/^-?\d+(\.\d+)?\.?$/.test(s)) return null
+
+  const normalized = s.endsWith('.') ? s.slice(0, -1) : s
+  const n = Number(normalized)
   return Number.isFinite(n) ? n : null
 }
 
-function numericEqual(actual: unknown, expected: unknown, absTol = 0.01): boolean {
-  const a = tryParseNumber(actual)
-  const e = tryParseNumber(expected)
-  if (a === null || e === null) return false
-  return Math.abs(a - e) <= absTol
+function parseFractionText(value: string): number | null {
+  const s = normalizeBasicText(normalizeLeadingNoise(removeKnownUnits(value))).replace(/÷/g, '/')
+  const m = s.match(/^(-?\d+)\/(\d+)$/)
+  if (!m) return null
+
+  const a = Number(m[1])
+  const b = Number(m[2])
+  if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) return null
+
+  return a / b
 }
 
-function findAnswerKeyItem(ctx: WorkerContext, roi: RoiCrop): WorkerAnswerKeyItem | null {
-  const items = ctx.answerKey?.answer_key?.items ?? []
+function parsePercentText(value: string): number | null {
+  const s = normalizeBasicText(normalizeLeadingNoise(removeKnownUnits(value))).replace(/％/g, '%')
+  const m = s.match(/^(-?\d+(\.\d+)?)%$/)
+  if (!m) return null
 
-  const byRoi = items.find((item) => item.roi_id === roi.roi_id)
-  if (byRoi) return byRoi
+  const n = Number(m[1])
+  return Number.isFinite(n) ? n : null
+}
 
-  const byQuestion = items.find(
-    (item) =>
-      item.page_number === roi.page_number &&
-      item.question_no != null &&
-      roi.question_no != null &&
-      item.question_no === roi.question_no
+function parseValue(value: string): ParsedValue | null {
+  const raw = asText(value)
+  if (!raw) return null
+
+  const unit = detectUnit(raw)
+
+  const percentNumeric = parsePercentText(raw)
+  if (percentNumeric != null) {
+    return {
+      kind: 'percent',
+      raw,
+      normalized: normalizeBasicText(normalizeLeadingNoise(raw)).replace(/％/g, '%'),
+      numeric: percentNumeric,
+      unit,
+    }
+  }
+
+  const fractionNumeric = parseFractionText(raw)
+  if (fractionNumeric != null) {
+    return {
+      kind: 'fraction',
+      raw,
+      normalized: normalizeBasicText(normalizeLeadingNoise(raw)).replace(/÷/g, '/'),
+      numeric: fractionNumeric,
+      unit,
+    }
+  }
+
+  const numberNumeric = parseNumericText(raw)
+  if (numberNumeric != null) {
+    const normalized = normalizeBasicText(normalizeLeadingNoise(removeKnownUnits(raw)))
+    const pretty =
+      /^-?\d+\.0+$/.test(normalized)
+        ? String(Number(normalized))
+        : normalized.endsWith('.')
+        ? normalized.slice(0, -1)
+        : normalized
+
+    return {
+      kind: 'number',
+      raw,
+      normalized: pretty,
+      numeric: numberNumeric,
+      unit,
+    }
+  }
+
+  return {
+    kind: 'string',
+    raw,
+    normalized: normalizeBasicText(normalizeLeadingNoise(raw)),
+    unit,
+  }
+}
+
+function answersFromKey(answerKeyItem: WorkerAnswerKeyItem | null): string[] {
+  if (!answerKeyItem) return []
+
+  const direct =
+    (answerKeyItem as any).correct_answer ??
+    (answerKeyItem as any).answer ??
+    (answerKeyItem as any).expected ??
+    (answerKeyItem as any).value ??
+    null
+
+  const base: string[] = []
+
+  if (Array.isArray(direct)) {
+    for (const item of direct) {
+      const s = asText(item)
+      if (s) base.push(s)
+    }
+  } else {
+    const s = asText(direct)
+    if (s) base.push(s)
+  }
+
+  const accepted = (answerKeyItem as any)?.accepted_answers
+  if (Array.isArray(accepted)) {
+    for (const item of accepted) {
+      const s = asText(item)
+      if (s) base.push(s)
+    }
+  }
+
+  return [...new Set(base)]
+}
+
+function detectExpectedAnswerType(
+  roi: RoiCrop,
+  answerKeyItem: WorkerAnswerKeyItem | null,
+  expectedValues: string[]
+): string {
+  const declared =
+    asNullableText((answerKeyItem as any)?.answer_type) ??
+    asNullableText(roi.answer_type)
+
+  if (declared) return declared
+
+  for (const value of expectedValues) {
+    const parsed = parseValue(value)
+    if (parsed) return parsed.kind
+  }
+
+  return 'text'
+}
+
+function normalizeExpectedTolerance(answerKeyItem: WorkerAnswerKeyItem | null): number {
+  const t = Number((answerKeyItem as any)?.tolerance ?? 1e-9)
+  return Number.isFinite(t) && t >= 0 ? t : 1e-9
+}
+
+function unitsEquivalent(a: string | null, b: string | null): boolean {
+  if (!a && !b) return true
+  if (!a || !b) return false
+  return normalizeUnitToken(a) === normalizeUnitToken(b)
+}
+
+function matchNumberLike(candidate: ParsedValue, expected: ParsedValue, tolerance: number): boolean {
+  if (!('numeric' in candidate) || !('numeric' in expected)) return false
+  if (!unitsEquivalent(candidate.unit, expected.unit)) return false
+  return Math.abs(candidate.numeric - expected.numeric) <= tolerance
+}
+
+function matchPercentEquivalent(
+  candidate: ParsedValue,
+  expected: ParsedValue,
+  tolerance: number
+): boolean {
+  if (!('numeric' in candidate) || !('numeric' in expected)) return false
+  if (!unitsEquivalent(candidate.unit, expected.unit)) return false
+
+  const candidateAsRatio =
+    candidate.kind === 'percent' ? candidate.numeric / 100 : candidate.numeric
+  const expectedAsRatio =
+    expected.kind === 'percent' ? expected.numeric / 100 : expected.numeric
+
+  return Math.abs(candidateAsRatio - expectedAsRatio) <= tolerance
+}
+
+function matchFractionDecimalPercent(
+  candidate: ParsedValue,
+  expected: ParsedValue,
+  tolerance: number
+): boolean {
+  if (!('numeric' in candidate) || !('numeric' in expected)) return false
+  if (!unitsEquivalent(candidate.unit, expected.unit)) return false
+
+  const candidateValue =
+    candidate.kind === 'percent' ? candidate.numeric / 100 : candidate.numeric
+  const expectedValue =
+    expected.kind === 'percent' ? expected.numeric / 100 : expected.numeric
+
+  return Math.abs(candidateValue - expectedValue) <= tolerance
+}
+
+function matchPlainText(candidate: ParsedValue, expected: ParsedValue): boolean {
+  return candidate.normalized === expected.normalized && unitsEquivalent(candidate.unit, expected.unit)
+}
+
+function chooseBestCandidate(candidates: PersistedCandidate[]): PersistedCandidate | null {
+  if (!Array.isArray(candidates) || candidates.length === 0) return null
+
+  const sorted = [...candidates].sort((a, b) => {
+    const ca = Number((a as any)?.confidence_score ?? 0)
+    const cb = Number((b as any)?.confidence_score ?? 0)
+    return cb - ca
+  })
+
+  return sorted[0] ?? null
+}
+
+function computeScoreWeight(roi: RoiCrop, answerKeyItem: WorkerAnswerKeyItem | null): number {
+  const itemPoints = Number((answerKeyItem as any)?.points ?? NaN)
+  if (Number.isFinite(itemPoints) && itemPoints > 0) return itemPoints
+
+  const itemWeight = Number((answerKeyItem as any)?.score_weight ?? NaN)
+  if (Number.isFinite(itemWeight) && itemWeight > 0) return itemWeight
+
+  const roiWeight = Number(roi.score_weight ?? NaN)
+  if (Number.isFinite(roiWeight) && roiWeight > 0) return roiWeight
+
+  const roiPoints = Number(roi.points ?? NaN)
+  if (Number.isFinite(roiPoints) && roiPoints > 0) return roiPoints
+
+  return 1
+}
+
+
+function matchCandidateAgainstExpected(
+  candidateRaw: string,
+  expectedValues: string[],
+  expectedType: string,
+  tolerance: number
+): boolean {
+  const candidate = parseValue(candidateRaw)
+  if (!candidate) return false
+
+  for (const expectedRaw of expectedValues) {
+    const expected = parseValue(expectedRaw)
+    if (!expected) continue
+
+    if (expectedType === 'number') {
+      if (matchNumberLike(candidate, expected, tolerance)) return true
+      continue
+    }
+
+    if (expectedType === 'percent') {
+      if (matchPercentEquivalent(candidate, expected, tolerance)) return true
+      continue
+    }
+
+    if (expectedType === 'fraction') {
+      if (matchFractionDecimalPercent(candidate, expected, tolerance)) return true
+      continue
+    }
+
+    if (expectedType === 'text' || expectedType === 'string') {
+      if (matchPlainText(candidate, expected)) return true
+      continue
+    }
+
+    if (matchFractionDecimalPercent(candidate, expected, tolerance)) return true
+    if (matchPlainText(candidate, expected)) return true
+  }
+
+  return false
+}
+
+export async function gradeMathAnswer({
+  ctx: _ctx,
+  roi,
+  candidates,
+  answerKeyItem,
+}: GradeMathAnswerArgs): Promise<GradeMathAnswerResult> {
+  const best = chooseBestCandidate(candidates)
+
+  if (!best) {
+    return {
+      auto_score: 0,
+      match_score: 0,
+      matched: false,
+      reason: 'no_candidates',
+      selected_candidate_id: null,
+      selected_candidate_text: null,
+      selected_candidate_normalized: null,
+      expected_answer: null,
+      expected_type: null,
+    }
+  }
+
+  const expectedValues = answersFromKey(answerKeyItem)
+  const expectedType = detectExpectedAnswerType(roi, answerKeyItem, expectedValues)
+  const tolerance = normalizeExpectedTolerance(answerKeyItem)
+
+  const selectedCandidateText = asNullableText((best as any).raw_text)
+  const selectedCandidateNormalized = asNullableText((best as any).normalized_value)
+
+  if (!answerKeyItem || expectedValues.length === 0) {
+    return {
+      auto_score: 0,
+      match_score: 0,
+      matched: false,
+      reason: 'no_answer_key',
+      selected_candidate_id: (best as any).id ?? null,
+      selected_candidate_text: selectedCandidateText,
+      selected_candidate_normalized: selectedCandidateNormalized,
+      expected_answer: null,
+      expected_type: expectedType,
+    }
+  }
+
+  const candidateRaw = selectedCandidateNormalized ?? selectedCandidateText ?? ''
+  const matched = matchCandidateAgainstExpected(
+    candidateRaw,
+    expectedValues,
+    expectedType,
+    tolerance
   )
 
-  return byQuestion ?? null
-}
-
-function engineConfidence(
-  candidates: PersistedCandidate[],
-  engine: 'google_vision' | 'paddle_ocr'
-): number {
-  const c = candidates.find((x) => x.engine_source === engine)
-  return clamp01(Number(c?.confidence_score ?? 0))
-}
-
-function engineText(
-  candidates: PersistedCandidate[],
-  engine: 'google_vision' | 'paddle_ocr'
-): string | null {
-  const c = candidates.find((x) => x.engine_source === engine)
-  return c?.raw_text ?? null
-}
-
-function getWeights() {
-  const alpha = Number(process.env.OCR_CONF_ALPHA ?? 0.35)
-  const beta = Number(process.env.OCR_CONF_BETA ?? 0.35)
-  const gamma = Number(process.env.OCR_CONF_GAMMA ?? 0.30)
-  const sum = alpha + beta + gamma || 1
+  const scoreWeight = computeScoreWeight(roi, answerKeyItem)
 
   return {
-    alpha: alpha / sum,
-    beta: beta / sum,
-    gamma: gamma / sum,
-  }
-}
-
-function getThreshold() {
-  return Number(process.env.OCR_CONF_THRESHOLD ?? 0.9)
-}
-
-export async function deterministicGradeRoi(
-  ctx: WorkerContext,
-  roi: RoiCrop,
-  candidates: PersistedCandidate[]
-): Promise<GradeDecision> {
-  const answerKeyItem = findAnswerKeyItem(ctx, roi)
-
-  if (!answerKeyItem) {
-    return {
-      matched: false,
-      auto_score: 0,
-      final_score: 0,
-      selected_candidate_id: candidates[0]?.id ?? null,
-      confidence: 0,
-      reason: 'answer_key_not_found',
-      evidence_map: {
-        roi_id: roi.roi_id,
-        page_number: roi.page_number,
-      },
-      ocr1_confidence: engineConfidence(candidates, 'google_vision'),
-      ocr2_confidence: engineConfidence(candidates, 'paddle_ocr'),
-      math_score: 0,
-      final_confidence: 0,
-      decision: 'needs_review',
-    }
-  }
-
-  const expectedValue = answerKeyItem.expected_value
-  const points = Number(answerKeyItem.points ?? roi.score_weight ?? 1)
-  const answerType = answerKeyItem.answer_type ?? roi.answer_type ?? 'text'
-
-  let best: PersistedCandidate | null = null
-  let matched = false
-
-  for (const candidate of candidates) {
-    let ok = false
-
-    if (answerType === 'number') {
-      ok = numericEqual(candidate.normalized_value, expectedValue, 0.01)
-    } else {
-      ok =
-        normalizeString(candidate.normalized_value) ===
-        normalizeString(expectedValue)
-    }
-
-    if (ok) {
-      best = candidate
-      matched = true
-      break
-    }
-
-    if (!best) best = candidate
-  }
-
-  if (!best && candidates.length > 0) {
-    best = [...candidates].sort(
-      (a, b) => Number(b.confidence_score ?? 0) - Number(a.confidence_score ?? 0)
-    )[0]
-  }
-
-  const c1 = engineConfidence(candidates, 'google_vision')
-  const c2 = engineConfidence(candidates, 'paddle_ocr')
-  const m = matched ? 1 : 0
-
-  const { alpha, beta, gamma } = getWeights()
-  const C = clamp01(alpha * c1 + beta * c2 + gamma * m)
-  const threshold = getThreshold()
-
-  const decision: 'auto_graded' | 'needs_review' =
-    C >= threshold ? 'auto_graded' : 'needs_review'
-
-  const autoScore = matched ? points : 0
-  const finalScore = autoScore
-
-  return {
+    auto_score: matched ? scoreWeight : 0,
+    match_score: matched ? 1 : 0,
     matched,
-    auto_score: autoScore,
-    final_score: finalScore,
-    selected_candidate_id: best?.id ?? null,
-    confidence: C,
-    reason: matched ? 'deterministic_match' : 'deterministic_no_match',
-    ocr1_confidence: c1,
-    ocr2_confidence: c2,
-    math_score: m,
-    final_confidence: C,
-    decision,
-    evidence_map: {
-      roi_id: roi.roi_id,
-      expected_value: expectedValue,
-      answer_type: answerType,
-      points,
-      ocr1_text: engineText(candidates, 'google_vision'),
-      ocr2_text: engineText(candidates, 'paddle_ocr'),
-      ocr1_confidence: c1,
-      ocr2_confidence: c2,
-      math_score: m,
-      alpha,
-      beta,
-      gamma,
-      final_confidence: C,
-      threshold,
-      decision,
-      selected_candidate_text: best?.raw_text ?? null,
-      selected_candidate_normalized: best?.normalized_value ?? null,
-    },
+    reason: matched ? 'matched' : 'not_matched',
+    selected_candidate_id: (best as any).id ?? null,
+    selected_candidate_text: selectedCandidateText,
+    selected_candidate_normalized: selectedCandidateNormalized,
+    expected_answer: expectedValues[0] ?? null,
+    expected_type: expectedType,
   }
 }
