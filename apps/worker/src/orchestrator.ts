@@ -9,6 +9,16 @@ import { verifyAndFinalize } from './stages/verifier'
 const POLL_INTERVAL_MS = Number(process.env.WORKER_POLL_INTERVAL_MS ?? 5000)
 const PIPELINE_VERSION = 'v2'
 
+const TERMINAL_STATUSES = new Set([
+  'graded',
+  'needs_review',
+  'reviewing',
+  'approved',
+  'published',
+  'appeal_open',
+  'appeal_resolved',
+])
+
 type SubmissionRow = {
   id: string
   status: string | null
@@ -96,11 +106,37 @@ async function markSubmissionError(
   }
 }
 
+async function computeSubmissionTotals(
+  submissionId: string
+): Promise<{ autoTotal: number; finalTotal: number }> {
+  const { data, error } = await supabase
+    .from('grading_results')
+    .select('auto_score, final_score')
+    .eq('submission_id', submissionId)
+
+  if (error) {
+    throw new Error(`Failed to compute submission totals: ${error.message}`)
+  }
+
+  const rows = Array.isArray(data) ? data : []
+
+  const autoTotal = rows.reduce((sum: number, row: any) => {
+    return sum + Number(row?.auto_score ?? 0)
+  }, 0)
+
+  const finalTotal = rows.reduce((sum: number, row: any) => {
+    return sum + Number(row?.final_score ?? 0)
+  }, 0)
+
+  return { autoTotal, finalTotal }
+}
+
 async function finalizeSubmission(
   submissionId: string,
   decision: 'auto_graded' | 'needs_review'
 ): Promise<void> {
   const nextStatus = decision === 'auto_graded' ? 'graded' : 'needs_review'
+  const totals = await computeSubmissionTotals(submissionId)
 
   const { error } = await supabase
     .from('submissions')
@@ -109,6 +145,8 @@ async function finalizeSubmission(
       current_stage: 'v2:done',
       last_error: null,
       pipeline_version: PIPELINE_VERSION,
+      auto_total_score: totals.autoTotal,
+      final_total_score: totals.finalTotal,
       updated_at: new Date().toISOString(),
     })
     .eq('id', submissionId)
@@ -144,17 +182,23 @@ async function lockNextSubmission(): Promise<SubmissionRow | null> {
   const { data: updated, error: updateError } = await supabase
     .from('submissions')
     .update({
-      status: 'processing',
+      status: 'ocr_running',
       current_stage: 'v2:locked',
+      last_error: null,
       pipeline_version: PIPELINE_VERSION,
       updated_at: new Date().toISOString(),
     })
     .eq('id', row.id)
-    .neq('current_stage', 'v2:locked')
+    .in('status', candidateStatuses)
+    .or('current_stage.is.null,current_stage.neq.v2:locked')
     .select('id, status, current_stage, last_error')
     .single()
 
-  if (updateError || !updated) {
+  if (updateError) {
+    throw new Error(`Failed to lock submission ${row.id}: ${updateError.message}`)
+  }
+
+  if (!updated) {
     return null
   }
 
@@ -283,9 +327,9 @@ export async function processSubmissionV2(submissionId: string): Promise<void> {
 
     const ctx = await loadContext(submissionId)
 
+    const submissionStatus = String(ctx.submission.status ?? '')
     if (
-      ctx.submission.status === 'graded' ||
-      ctx.submission.status === 'needs_review' ||
+      TERMINAL_STATUSES.has(submissionStatus) ||
       ctx.submission.current_stage === 'v2:done'
     ) {
       console.log('[worker] skip already completed submission', {
@@ -302,13 +346,22 @@ export async function processSubmissionV2(submissionId: string): Promise<void> {
         page_number: p.page_number,
         storage_path: p.storage_path,
       })),
-      layoutVersion: ctx.layoutSpec.version,
+      layoutSpec: {
+        id: ctx.layoutSpec.id,
+        version: ctx.layoutSpec.version,
+        is_active: ctx.layoutSpec.is_active ?? null,
+        layout_status: ctx.layoutSpec.layout_status ?? null,
+      },
       answerKeyItems: Array.isArray(ctx.answerKeyItems) ? ctx.answerKeyItems.length : 0,
     })
 
     let overallDecision: 'auto_graded' | 'needs_review' = 'auto_graded'
+    let totalRoisProcessed = 0
 
     const pages = Array.isArray(ctx.pages) ? ctx.pages : []
+    if (pages.length === 0) {
+      throw new Error(`Submission files not found for submission ${submissionId}`)
+    }
 
     for (const page of pages) {
       const pageNumber = Number(page.page_number ?? 1)
@@ -322,6 +375,8 @@ export async function processSubmissionV2(submissionId: string): Promise<void> {
         pageNo: pageNumber,
         count: rois.length,
       })
+
+      totalRoisProcessed += rois.length
 
       for (const roi of rois) {
         await markSubmissionStage(
@@ -337,7 +392,19 @@ export async function processSubmissionV2(submissionId: string): Promise<void> {
       }
     }
 
-    console.log('[worker] finalize start', { submissionId })
+    if (totalRoisProcessed === 0) {
+      throw new Error(
+        'No ROI found from selected layout spec; cannot run OCR/grading'
+      )
+    }
+
+    await markSubmissionStage(submissionId, 'v2:finalize')
+
+    console.log('[worker] finalize start', {
+      submissionId,
+      overallDecision,
+      totalRoisProcessed,
+    })
 
     await finalizeSubmission(submissionId, overallDecision)
 

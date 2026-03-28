@@ -4,13 +4,16 @@
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 
+
 export default function UploadSubmissionForm({
   assignmentId,
+  studentId,
   currentStatus,
   openAt,
   closeAt,
 }: {
   assignmentId: string
+  studentId: string
   currentStatus: string
   openAt?: string | null
   closeAt?: string | null
@@ -46,7 +49,7 @@ export default function UploadSubmissionForm({
       for (const file of files) {
         formData.append('files', file)
       }
-
+         formData.append('studentId',studentId)
       const res = await fetch(`/api/student/assignments/${assignmentId}/submit`, {
         method: 'POST',
         body: formData,

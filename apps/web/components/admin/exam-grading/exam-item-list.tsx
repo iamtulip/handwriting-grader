@@ -1,37 +1,30 @@
 'use client'
 
 import { useMemo, useState } from 'react'
+import type { ExamGradingItem } from '@/lib/admin/exam-grading'
 import { ExamItemCard } from './exam-item-card'
 
-type Item = {
-  itemNo: string
-  pageNumber: number | null
-  roiImageUrl: string | null
-  expectedAnswer: string | null
-  answerType: string | null
-  autoScore: number | null
-  finalScore: number | null
-  confidence: number | null
-  decision: 'auto_graded' | 'needs_review'
-  selectedCandidateText: string | null
-  selectedCandidateNormalized: string | null
-  googleRawByVariant: Array<{ variant: string; results: any[] }>
-  ocr2RawByVariant: Array<{ variant: string; results: any[] }>
-  candidates: any[]
-  reason: string | null
-  bboxNorm: [number, number, number, number] | null
-}
-
 type Props = {
-  items: Item[]
+  items: ExamGradingItem[]
 }
 
 export function ExamItemList({ items }: Props) {
-  const [filter, setFilter] = useState<'all' | 'auto_graded' | 'needs_review'>('all')
+  const [filter, setFilter] = useState<'all' | 'auto_graded' | 'needs_review'>(
+    'all'
+  )
 
   const filteredItems = useMemo(() => {
-    if (filter === 'all') return items
-    return items.filter((item) => item.decision === filter)
+    const base =
+      filter === 'all'
+        ? items
+        : items.filter((item) => item.decision === filter)
+
+    return [...base].sort((a, b) =>
+      a.itemNo.localeCompare(b.itemNo, 'th', {
+        numeric: true,
+        sensitivity: 'base',
+      })
+    )
   }, [items, filter])
 
   return (
@@ -69,11 +62,15 @@ export function ExamItemList({ items }: Props) {
         >
           Needs review
         </button>
+
+        <span className="ml-auto rounded-full bg-neutral-100 px-3 py-1 text-sm text-neutral-600">
+          {filteredItems.length} items
+        </span>
       </div>
 
       <div className="space-y-4">
         {filteredItems.map((item) => (
-          <ExamItemCard key={item.itemNo} item={item} />
+          <ExamItemCard key={`${item.itemNo}-${item.roiId ?? 'roi'}`} item={item} />
         ))}
       </div>
     </div>

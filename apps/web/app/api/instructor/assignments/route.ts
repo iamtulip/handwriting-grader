@@ -77,23 +77,24 @@ export async function GET(req: Request) {
 
   let query = supabase
     .from('assignments')
-    .select(`
-      id,
-      title,
-      description,
-      assignment_type,
-      week_number,
-      class_date,
-      open_at,
-      due_at,
-      close_at,
-      end_of_friday_at,
-      section_id,
-      created_by,
-      created_by_user_id,
-      created_at,
-      updated_at
-    `)
+  .select(`
+  id,
+  title,
+  description,
+  assignment_type,
+  workflow_mode,
+  week_number,
+  class_date,
+  open_at,
+  due_at,
+  close_at,
+  end_of_friday_at,
+  section_id,
+  created_by,
+  created_by_user_id,
+  created_at,
+  updated_at
+`)
     .in('section_id', targetSectionIds)
     .order('class_date', { ascending: false, nullsFirst: false })
     .order('created_at', { ascending: false })
@@ -125,7 +126,7 @@ export async function GET(req: Request) {
 
   const { data: sections, error: sectionsError } = await supabase
     .from('sections')
-    .select('id, course_code, section_number, term')
+    .select('id, course_code, section_number, term, section_kind, is_system_generated')
     .in('id', sectionIds)
 
   if (sectionsError) {
@@ -200,6 +201,9 @@ export async function GET(req: Request) {
       uploaded_count,
       avg_total_score: Number(avg_total_score.toFixed(2)),
       is_archived: false,
+      workflow_mode: assignment.workflow_mode ?? 'course_assignment',
+      section_kind: section?.section_kind ?? 'course',
+      is_system_generated: Boolean(section?.is_system_generated ?? false),
     }
   })
 

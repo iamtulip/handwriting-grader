@@ -10,6 +10,47 @@ export type OcrVariantResult = {
   results: any[]
 }
 
+export type ExamCandidate = {
+  rawText: string | null
+  normalizedValue: string | null
+  confidenceScore: number | null
+  engineSource: string | null
+  kind: string | null
+  numericValue: number | null
+  unit: string | null
+}
+
+export type ExamEvidenceMap = {
+  c1: number | null
+  c2: number | null
+  m: number | null
+  formula: string | null
+}
+
+export type ExamGradingItem = {
+  itemNo: string
+  roiId: string | null
+  questionNo: string | null
+  pageNumber: number | null
+  roiImageUrl: string | null
+  expectedAnswer: string | null
+  answerType: string | null
+  autoScore: number | null
+  finalScore: number | null
+  confidence: number | null
+  decision: 'auto_graded' | 'needs_review'
+  selectedCandidateText: string | null
+  selectedCandidateNormalized: string | null
+  googleRawByVariant: OcrVariantResult[]
+  ocr2RawByVariant: OcrVariantResult[]
+  mergedCandidates: ExamCandidate[]
+  persistedCandidates: ExamCandidate[]
+  reason: string | null
+  bboxNorm: [number, number, number, number] | null
+  scoreWeight: number | null
+  evidenceMap: ExamEvidenceMap | null
+}
+
 export type ExamGradingDetail = {
   submission: {
     id: string
@@ -32,24 +73,7 @@ export type ExamGradingDetail = {
     averageConfidence: number
     workloadReductionPercent: number
   }
-  items: Array<{
-    itemNo: string
-    pageNumber: number | null
-    roiImageUrl: string | null
-    expectedAnswer: string | null
-    answerType: string | null
-    autoScore: number | null
-    finalScore: number | null
-    confidence: number | null
-    decision: 'auto_graded' | 'needs_review'
-    selectedCandidateText: string | null
-    selectedCandidateNormalized: string | null
-    googleRawByVariant: OcrVariantResult[]
-    ocr2RawByVariant: OcrVariantResult[]
-    candidates: any[]
-    reason: string | null
-    bboxNorm: [number, number, number, number] | null
-  }>
+  items: ExamGradingItem[]
 }
 
 function avg(values: number[]): number {
@@ -59,6 +83,12 @@ function avg(values: number[]): number {
 
 function safeArray<T>(value: unknown): T[] {
   return Array.isArray(value) ? (value as T[]) : []
+}
+
+function asRecord(value: unknown): Record<string, any> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, any>)
+    : {}
 }
 
 function toNumberOrNull(value: unknown): number | null {
@@ -89,7 +119,82 @@ function toBboxNorm(
 
 function signedUrlFromPath(path: string | null | undefined): string | null {
   if (!path) return null
-  return /api/gcs/signed-read?path=${encodeURIComponent(path)}
+  return `/api/gcs/signed-read?path=${encodeURIComponent(path)}`
+}
+
+function normalizeOcrVariantResults(value: unknown): OcrVariantResult[] {
+  return safeArray<any>(value).map((row, index) => ({
+    variant: toStringOrNull(row?.variant) ?? `variant_${index + 1}`,
+    results: safeArray<any>(row?.results),
+  }))
+}
+
+function normalizeCandidate(value: unknown): ExamCandidate | null {
+  if (typeof value === 'string') {
+    const s = toStringOrNull(value)
+    if (!s) return null
+
+    return {
+      rawText: s,
+      normalizedValue: s,
+      confidenceScore: null,
+      engineSource: null,
+      kind: null,
+      numericValue: null,
+      unit: null,
+    }
+  }
+
+  const row = asRecord(value)
+
+  const rawText =
+    toStringOrNull(row.raw_text) ??
+    toStringOrNull(row.rawText) ??
+    toStringOrNull(row.text)
+
+  const normalizedValue =
+    toStringOrNull(row.normalized_value) ??
+    toStringOrNull(row.normalizedValue) ??
+    toStringOrNull(row.normalized)
+
+  if (!rawText && !normalizedValue) return null
+
+  return {
+    rawText,
+    normalizedValue,
+    confidenceScore:
+      toNumberOrNull(row.confidence_score) ??
+      toNumberOrNull(row.confidence),
+    engineSource:
+      toStringOrNull(row.engine_source) ??
+      toStringOrNull(row.engineSource),
+    kind: toStringOrNull(row.kind) ?? toStringOrNull(row.type),
+    numericValue:
+      toNumberOrNull(row.numeric_value) ??
+      toNumberOrNull(row.numericValue),
+    unit: toStringOrNull(row.unit),
+  }
+}
+
+function normalizeCandidates(value: unknown): ExamCandidate[] {
+  return safeArray<any>(value)
+    .map((item) => normalizeCandidate(item))
+    .filter((item): item is ExamCandidate => item !== null)
+}
+
+function normalizeEvidenceMap(value: unknown): ExamEvidenceMap | null {
+  const row = asRecord(value)
+
+  const c1 = toNumberOrNull(row.c1)
+  const c2 = toNumberOrNull(row.c2)
+  const m = toNumberOrNull(row.m)
+  const formula = toStringOrNull(row.formula)
+
+  if (c1 == null && c2 == null && m == null && formula == null) {
+    return null
+  }
+
+  return { c1, c2, m, formula }
 }
 
 export async function getExamGradingDetail(
@@ -161,20 +266,21 @@ export async function getExamGradingDetail(
       imageUrl: signedUrlFromPath(row.storage_path) ?? '',
     })) ?? []
 
-  const items =
+  const items: ExamGradingItem[] =
     (gradingRows ?? []).map((row: any) => {
-      const debug = row.debug_payload ?? {}
-      const grade = debug.grade ?? {}
-      const final = debug.final ?? {}
+      const debug = asRecord(row.debug_payload)
+      const grade = asRecord(debug.grade)
+      const final = asRecord(debug.final)
 
-      const decision: 'auto_graded' | 'needs_review' = toDecision(
-        final.decision
-      )
+      const decision = toDecision(final.decision)
 
       const confidence =
         toNumberOrNull(row.confidence_score) ??
         toNumberOrNull(final.final_confidence) ??
         0
+
+      const mergedCandidates = normalizeCandidates(debug.merged_candidates)
+      const persistedCandidates = normalizeCandidates(debug.persisted_candidates)
 
       const selectedCandidateText =
         toStringOrNull(final.selected_candidate_text) ??
@@ -196,24 +302,18 @@ export async function getExamGradingDetail(
         toStringOrNull(debug.answer_type) ??
         null
 
-      const googleRawByVariant = safeArray<OcrVariantResult>(
-        debug.google_raw_by_variant
-      )
-
-      const ocr2RawByVariant = safeArray<OcrVariantResult>(
-        debug.paddle_raw_by_variant
-      )
-
-      const candidates = safeArray<any>(debug.merged_candidates)
-
       const reason =
         toStringOrNull(grade.reason) ??
         toStringOrNull(final.reason) ??
-        (candidates.length === 0 ? 'no_candidates' : null)
+        (mergedCandidates.length === 0 ? 'no_candidates' : null)
 
       return {
         itemNo: String(row.item_no),
-        pageNumber: toNumberOrNull(row.page_number),
+        roiId: toStringOrNull(debug.roi_id),
+        questionNo: toStringOrNull(debug.question_no),
+        pageNumber:
+          toNumberOrNull(row.page_number) ??
+          toNumberOrNull(debug.page_number),
         roiImageUrl: signedUrlFromPath(toStringOrNull(debug.debug_roi_path)),
         expectedAnswer,
         answerType,
@@ -223,11 +323,18 @@ export async function getExamGradingDetail(
         decision,
         selectedCandidateText,
         selectedCandidateNormalized,
-        googleRawByVariant,
-        ocr2RawByVariant,
-        candidates,
+        googleRawByVariant: normalizeOcrVariantResults(
+          debug.google_raw_by_variant
+        ),
+        ocr2RawByVariant: normalizeOcrVariantResults(
+          debug.paddle_raw_by_variant
+        ),
+        mergedCandidates,
+        persistedCandidates,
         reason,
         bboxNorm: toBboxNorm(debug.bbox_norm),
+        scoreWeight: toNumberOrNull(debug.score_weight),
+        evidenceMap: normalizeEvidenceMap(final.evidence_map),
       }
     }) ?? []
 
@@ -238,7 +345,7 @@ export async function getExamGradingDetail(
     const ocr2Readable = item.ocr2RawByVariant.some(
       (entry) => safeArray<any>(entry.results).length > 0
     )
-    const candidateReadable = item.candidates.length > 0
+    const candidateReadable = item.mergedCandidates.length > 0
 
     return googleReadable || ocr2Readable || candidateReadable
   }).length

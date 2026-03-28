@@ -20,6 +20,7 @@ async function getOverview() {
 
 export default async function InstructorOverviewPage() {
   const data = await getOverview()
+  const needsReviewCount = Number(data.stats?.needsReviewCount ?? 0)
 
   return (
     <div className="space-y-8 max-w-7xl mx-auto">
@@ -31,13 +32,21 @@ export default async function InstructorOverviewPage() {
           </p>
         </div>
 
-        <div className="flex gap-3">
+        <div className="flex flex-wrap gap-3">
+  <Link
+    href="/instructor/review"
+    className="inline-flex items-center justify-center px-4 py-2 rounded-lg bg-red-600 text-white font-semibold hover:bg-red-700 transition-colors"
+  >
+    Review Queue
+  </Link>
+
           <Link
             href="/instructor/assignments"
             className="inline-flex items-center justify-center px-4 py-2 rounded-lg bg-blue-600 text-white font-semibold hover:bg-blue-700 transition-colors"
           >
             ดู Assignments
           </Link>
+
           <Link
             href="/instructor/sections"
             className="inline-flex items-center justify-center px-4 py-2 rounded-lg bg-slate-900 text-white font-semibold hover:bg-slate-800 transition-colors"
@@ -48,10 +57,38 @@ export default async function InstructorOverviewPage() {
       </header>
 
       <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
+  <Card title="จำนวนกลุ่มเรียน" value={String(data.stats.sectionCount ?? 0)} />
+  <Card title="Assignments ล่าสุด" value={String(data.stats.assignmentCount ?? 0)} />
+  <Card title="งานส่งวันนี้" value={String(data.stats.todaySubmissionCount ?? 0)} />
+
+  <Link
+    href="/instructor/review"
+    className="block rounded-xl border border-red-200 bg-white p-5 shadow-sm hover:bg-red-50 hover:border-red-300 transition-colors"
+  >
+    <div className="text-sm text-slate-500 font-medium">รอตรวจ</div>
+    <div className="text-3xl font-extrabold text-red-600 mt-2">
+      {String(data.stats.needsReviewCount ?? 0)}
+    </div>
+    <div className="mt-3 text-sm font-semibold text-red-700">
+      เปิดหน้าตรวจ →
+    </div>
+  </Link>
+</section>
+<section className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <Card title="จำนวนกลุ่มเรียน" value={String(data.stats.sectionCount ?? 0)} />
         <Card title="Assignments ล่าสุด" value={String(data.stats.assignmentCount ?? 0)} />
         <Card title="งานส่งวันนี้" value={String(data.stats.todaySubmissionCount ?? 0)} />
-        <Card title="รอตรวจ" value={String(data.stats.needsReviewCount ?? 0)} />
+
+        <Link
+          href="/instructor/review"
+          className="block rounded-xl border border-red-200 bg-white p-5 shadow-sm hover:bg-red-50 hover:border-red-300 transition-colors"
+        >
+          <div className="text-sm text-slate-500 font-medium">รอตรวจ</div>
+          <div className="text-3xl font-extrabold text-red-600 mt-2">{needsReviewCount}</div>
+          <div className="mt-3 text-sm font-semibold text-red-700">
+            เปิด Review Queue →
+          </div>
+        </Link>
       </section>
 
       <section className="grid grid-cols-1 xl:grid-cols-2 gap-6">
@@ -86,8 +123,15 @@ export default async function InstructorOverviewPage() {
         </div>
 
         <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
-          <div className="p-5 border-b border-slate-200 bg-slate-50">
+          <div className="p-5 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
             <div className="font-bold text-slate-800 text-lg">Assignments ล่าสุด</div>
+
+            <Link
+              href="/instructor/review"
+              className="text-sm font-semibold text-red-600 hover:text-red-700"
+            >
+              ไปที่ Review Queue
+            </Link>
           </div>
 
           <div className="divide-y divide-slate-100">
@@ -100,10 +144,20 @@ export default async function InstructorOverviewPage() {
                       สัปดาห์ที่ {a.week_number ?? '-'} • submissions {a.submission_count ?? 0}
                     </div>
                   </div>
-                  <div className="text-right text-sm">
+
+                  <div className="text-right text-sm space-y-2">
                     <div className="font-bold text-red-600">
                       needs review: {a.needs_review_count ?? 0}
                     </div>
+
+                    {Number(a.needs_review_count ?? 0) > 0 && (
+                      <Link
+                        href={`/instructor/review`}
+                        className="inline-flex rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-red-700"
+                      >
+                        Review
+                      </Link>
+                    )}
                   </div>
                 </div>
               </div>

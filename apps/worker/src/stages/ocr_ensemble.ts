@@ -10,9 +10,8 @@ import { parseMathCandidatesFromOcr } from './ocr_math_parser'
 import type { WorkerContext } from './load_context'
 import type { RoiCrop } from './roi_crop'
 
-
 const SUBMISSION_BUCKET = process.env.SUBMISSION_FILES_BUCKET || 'submission-files'
-const GOOGLE_TIMEOUT_MS = 20000
+const GOOGLE_TIMEOUT_MS = Number(process.env.GOOGLE_TIMEOUT_MS ?? 20000)
 
 function resolveVisionKeyPath(): string | undefined {
   const envPath = process.env.GOOGLE_APPLICATION_CREDENTIALS
@@ -66,10 +65,15 @@ export type OcrEnsembleResult = {
   debug: OcrDebugInfo
 }
 
-function normalizeRawText(s: string): string {
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0
+  return Math.max(0, Math.min(1, value))
+}
+
+function normalizeFallbackText(s: string): string {
   return s
     .replace(/\s+/g, '')
-    .replace(/,/g, '')
+    .replace(/[，,]/g, '')
     .replace(/[Oo๐]/g, '0')
     .replace(/[lI|]/g, '1')
     .replace(/[Ss]/g, '5')
@@ -77,6 +81,13 @@ function normalizeRawText(s: string): string {
     .replace(/×/g, '*')
     .replace(/÷/g, '/')
     .trim()
+}
+
+function splitRawIntoLines(text: string): string[] {
+  return String(text ?? '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
 }
 
 function dedupeCandidates<T extends { raw_text?: string | null; normalized_value?: string | null }>(
@@ -236,6 +247,70 @@ async function runGoogleVisionOnBuffer(
   ]
 }
 
+function buildLineAwareCandidates(
+  rawText: string,
+  baseConfidence: number,
+  engineSource: string
+): OcrCandidate[] {
+  const lines = splitRawIntoLines(rawText)
+  const candidates: OcrCandidate[] = []
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i]
+    if (!line) continue
+
+    const lineBias = i === 0 ? 0.04 : i === 1 ? 0.015 : 0
+    const linePenalty = i * 0.04
+    const adjustedConfidence = clamp01(baseConfidence + lineBias - linePenalty)
+
+    const parsed = parseMathCandidatesFromOcr(line, adjustedConfidence)
+
+    if (parsed.length > 0) {
+      for (const p of parsed) {
+        candidates.push({
+          raw_text: p.raw_text,
+          normalized_value: p.normalized_value,
+          confidence_score: clamp01(p.confidence_score),
+          engine_source: engineSource,
+        })
+      }
+      continue
+    }
+
+    const fallbackNormalized = normalizeFallbackText(line)
+    if (fallbackNormalized) {
+      candidates.push({
+        raw_text: line,
+        normalized_value: fallbackNormalized,
+        confidence_score: clamp01(adjustedConfidence * 0.75),
+        engine_source: `${engineSource}:fallback_line`,
+      })
+    }
+  }
+
+  // ถ้ามีแค่บรรทัดเดียว ค่อยเก็บทั้งก้อนเป็น fallback
+  if (candidates.length === 0 && lines.length <= 1) {
+    const fallback = normalizeFallbackText(rawText)
+    if (fallback) {
+      candidates.push({
+        raw_text: rawText.trim(),
+        normalized_value: fallback,
+        confidence_score: clamp01(baseConfidence * 0.65),
+        engine_source: `${engineSource}:fallback_block`,
+      })
+    }
+  }
+
+  return candidates
+}
+
+function candidateSortScore(candidate: OcrCandidate): number {
+  const conf = Number(candidate.confidence_score ?? 0)
+  const lenPenalty = Math.min(String(candidate.normalized_value ?? '').length, 40) * 0.0025
+  const engineBonus = String(candidate.engine_source ?? '').includes(':original') ? 0.01 : 0
+  return conf + engineBonus - lenPenalty
+}
+
 export async function runOcrEnsembleForRoi(
   ctx: WorkerContext,
   roi: RoiCrop
@@ -290,12 +365,13 @@ export async function runOcrEnsembleForRoi(
         const raw = String(r.text ?? '').trim()
         if (!raw) continue
 
-        candidates.push({
-          raw_text: raw,
-          normalized_value: normalizeRawText(raw),
-          confidence_score: Number(r.confidence ?? 0),
-          engine_source: `google:${variant.name}`,
-        })
+        const parsedCandidates = buildLineAwareCandidates(
+          raw,
+          Number(r.confidence ?? 0),
+          `google:${variant.name}`
+        )
+
+        candidates.push(...parsedCandidates)
       }
 
       console.log('[worker] Google OCR ok', {
@@ -352,18 +428,19 @@ export async function runOcrEnsembleForRoi(
       const raw = String(r.text ?? '').trim()
       if (!raw) continue
 
-      candidates.push({
-        raw_text: raw,
-        normalized_value: normalizeRawText(raw),
-        confidence_score: Number(r.confidence ?? 0),
-        engine_source: `paddle:${variant.name}`,
-      })
+      const parsedCandidates = buildLineAwareCandidates(
+        raw,
+        Number(r.confidence ?? 0),
+        `paddle:${variant.name}`
+      )
+
+      candidates.push(...parsedCandidates)
     }
   }
 
   const cleaned = candidates
-    .filter((c) => c.raw_text.trim().length > 0)
-    .sort((a, b) => (b.confidence_score ?? 0) - (a.confidence_score ?? 0))
+    .filter((c) => c.raw_text.trim().length > 0 && c.normalized_value.trim().length > 0)
+    .sort((a, b) => candidateSortScore(b) - candidateSortScore(a))
 
   const deduped = dedupeCandidates(cleaned)
 
@@ -371,7 +448,7 @@ export async function runOcrEnsembleForRoi(
     roi_id: roi.roi_id,
     page_number: roi.page_number,
     total: deduped.length,
-    top3: deduped.slice(0, 3),
+    top5: deduped.slice(0, 5),
   })
 
   return {

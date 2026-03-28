@@ -67,6 +67,7 @@ export default async function WeeklyDetailPage({
 
       <UploadSubmissionForm
         assignmentId={assignmentId}
+        studentId={studentId}
         currentStatus={data.submission.status ?? 'not_submitted'}
         openAt={data.assignment.open_at}
         closeAt={data.assignment.close_at}

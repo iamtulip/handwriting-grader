@@ -26,7 +26,6 @@ function cleanRawText(text: string): string {
     .replace(/\r/g, ' ')
     .replace(/\n/g, ' ')
     .replace(/\s+/g, ' ')
-    .replace(/[，,]/g, '')
     .replace(/[−–—]/g, '-')
     .trim()
 }
@@ -38,8 +37,11 @@ function stripLeadingNoise(text: string): string {
 function normalizePlainNumber(text: string): string {
   let s = stripLeadingNoise(cleanRawText(text))
 
+  // รองรับ OCR ที่แทรกช่องว่างหรือ comma ระหว่างหลักพัน
+  s = s.replace(/(?<=\d)[,\s](?=\d{3}(\D|$))/g, '')
+  s = s.replace(/[，,]/g, '')
   s = s.replace(/\s+/g, '')
-  s = s.replace(/^\+/, '')
+  s = s.replace(/^\\+/, '')
 
   if (/^-?\d+\.$/.test(s)) {
     s = s.slice(0, -1)
@@ -58,7 +60,6 @@ function parseNumberSafe(text: string): number | null {
   if (!/^-?\d+(\.\d+)?$/.test(s)) return null
 
   const n = Number(s)
-
   if (!Number.isFinite(n)) return null
 
   return n
@@ -66,23 +67,18 @@ function parseNumberSafe(text: string): number | null {
 
 function normalizeFraction(text: string): string {
   let s = stripLeadingNoise(cleanRawText(text))
-
   s = s.replace(/\s+/g, '')
   s = s.replace(/÷/g, '/')
-
   return s
 }
 
 function parseFractionValue(text: string): number | null {
   const s = normalizeFraction(text)
-
   const m = s.match(/^(-?\d+)\/(\d+)$/)
-
   if (!m) return null
 
   const a = Number(m[1])
   const b = Number(m[2])
-
   if (!Number.isFinite(a) || !Number.isFinite(b) || b === 0) return null
 
   return a / b
@@ -90,24 +86,18 @@ function parseFractionValue(text: string): number | null {
 
 function normalizePercent(text: string): string {
   let s = stripLeadingNoise(cleanRawText(text))
-
   s = s.replace(/\s+/g, '')
   s = s.replace(/％/g, '%')
-
   return s
 }
 
 function parsePercentValue(text: string): number | null {
   const s = normalizePercent(text)
-
   const m = s.match(/^(-?\d+(\.\d+)?)%$/)
-
   if (!m) return null
 
   const n = Number(m[1])
-
   if (!Number.isFinite(n)) return null
-
   return n
 }
 
@@ -121,21 +111,48 @@ function detectUnit(text: string): string | null {
   return null
 }
 
+function extractGroupedNumberCandidates(
+  text: string,
+  confidence: number
+): ParsedMathCandidate[] {
+  const cleaned = cleanRawText(text)
+
+  const matches =
+    cleaned.match(/[-+]?\d{1,3}(?:[,\s]\d{3})+(?:\.\d+)?\.?/g) ?? []
+
+  const results: ParsedMathCandidate[] = []
+
+  for (const m of matches) {
+    const normalized = normalizePlainNumber(m)
+    const numeric = parseNumberSafe(normalized)
+    if (numeric === null) continue
+
+    results.push({
+      kind: 'number',
+      raw_text: m,
+      normalized_value: normalized,
+      numeric_value: numeric,
+      confidence_score: confidence + 0.03,
+      unit: detectUnit(text),
+    })
+  }
+
+  return uniqBy(results, (c) => `${c.kind}:${c.normalized_value}`)
+}
+
 function extractNumberCandidates(
   text: string,
   confidence: number
 ): ParsedMathCandidate[] {
   const cleaned = cleanRawText(text)
 
-  const matches = cleaned.match(/[-+]?\d+(\.\d+)?\.?/g) ?? []
+  const matches = cleaned.match(/[-+]?\d+(?:\.\d+)?\.?/g) ?? []
 
   const results: ParsedMathCandidate[] = []
 
   for (const m of matches) {
     const normalized = normalizePlainNumber(m)
-
     const numeric = parseNumberSafe(normalized)
-
     if (numeric === null) continue
 
     results.push({
@@ -156,16 +173,13 @@ function extractFractionCandidates(
   confidence: number
 ): ParsedMathCandidate[] {
   const cleaned = cleanRawText(text)
-
   const matches = cleaned.match(/[-+]?\d+\s*\/\s*\d+/g) ?? []
 
   const results: ParsedMathCandidate[] = []
 
   for (const m of matches) {
     const normalized = normalizeFraction(m)
-
     const numeric = parseFractionValue(normalized)
-
     if (numeric === null) continue
 
     results.push({
@@ -186,16 +200,13 @@ function extractPercentCandidates(
   confidence: number
 ): ParsedMathCandidate[] {
   const cleaned = cleanRawText(text)
-
-  const matches = cleaned.match(/[-+]?\d+(\.\d+)?\s*%/g) ?? []
+  const matches = cleaned.match(/[-+]?\d+(?:\.\d+)?\s*%/g) ?? []
 
   const results: ParsedMathCandidate[] = []
 
   for (const m of matches) {
     const normalized = normalizePercent(m)
-
     const numeric = parsePercentValue(normalized)
-
     if (numeric === null) continue
 
     results.push({
@@ -219,11 +230,12 @@ export function parseMathCandidatesFromOcr(
 
   if (!text) return []
 
+  const groupedNumbers = extractGroupedNumberCandidates(text, confidenceScore)
   const fractions = extractFractionCandidates(text, confidenceScore)
   const percents = extractPercentCandidates(text, confidenceScore)
   const numbers = extractNumberCandidates(text, confidenceScore)
 
-  const merged = [...fractions, ...percents, ...numbers]
+  const merged = [...groupedNumbers, ...fractions, ...percents, ...numbers]
 
   if (merged.length === 0) {
     return [
@@ -238,5 +250,5 @@ export function parseMathCandidatesFromOcr(
     ]
   }
 
-  return merged
+  return uniqBy(merged, (c) => `${c.kind}:${c.normalized_value}`)
 }

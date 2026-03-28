@@ -1,4 +1,5 @@
 // apps/web/components/roster/RosterUpload.tsx
+'use client'
 import React, { useMemo, useState, useEffect } from 'react'
 import Papa from 'papaparse'
 import * as XLSX from 'xlsx'

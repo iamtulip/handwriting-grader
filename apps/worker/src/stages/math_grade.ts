@@ -262,10 +262,12 @@ function detectExpectedAnswerType(
   return 'text'
 }
 
-function normalizeExpectedTolerance(answerKeyItem: WorkerAnswerKeyItem | null): number {
+function normalizeExpectedTolerance(answerKeyItem: WorkerAnswerItem | null): number {
   const t = Number((answerKeyItem as any)?.tolerance ?? 1e-9)
   return Number.isFinite(t) && t >= 0 ? t : 1e-9
 }
+
+type WorkerAnswerItem = WorkerAnswerKeyItem
 
 function unitsEquivalent(a: string | null, b: string | null): boolean {
   if (!a && !b) return true
@@ -315,18 +317,6 @@ function matchPlainText(candidate: ParsedValue, expected: ParsedValue): boolean 
   return candidate.normalized === expected.normalized && unitsEquivalent(candidate.unit, expected.unit)
 }
 
-function chooseBestCandidate(candidates: PersistedCandidate[]): PersistedCandidate | null {
-  if (!Array.isArray(candidates) || candidates.length === 0) return null
-
-  const sorted = [...candidates].sort((a, b) => {
-    const ca = Number((a as any)?.confidence_score ?? 0)
-    const cb = Number((b as any)?.confidence_score ?? 0)
-    return cb - ca
-  })
-
-  return sorted[0] ?? null
-}
-
 function computeScoreWeight(roi: RoiCrop, answerKeyItem: WorkerAnswerKeyItem | null): number {
   const itemPoints = Number((answerKeyItem as any)?.points ?? NaN)
   if (Number.isFinite(itemPoints) && itemPoints > 0) return itemPoints
@@ -342,7 +332,6 @@ function computeScoreWeight(roi: RoiCrop, answerKeyItem: WorkerAnswerKeyItem | n
 
   return 1
 }
-
 
 function matchCandidateAgainstExpected(
   candidateRaw: string,
@@ -384,15 +373,134 @@ function matchCandidateAgainstExpected(
   return false
 }
 
+function commonPrefixLength(a: string, b: string): number {
+  const aa = a.replace(/[^\dA-Za-z.-]/g, '')
+  const bb = b.replace(/[^\dA-Za-z.-]/g, '')
+  const n = Math.min(aa.length, bb.length)
+
+  let i = 0
+  while (i < n && aa[i] === bb[i]) i += 1
+  return i
+}
+
+function approximateSimilarity(
+  candidateRaw: string,
+  expectedValues: string[],
+  expectedType: string
+): number {
+  const candidate = parseValue(candidateRaw)
+  if (!candidate) return -999
+
+  let best = -999
+
+  for (const expectedRaw of expectedValues) {
+    const expected = parseValue(expectedRaw)
+    if (!expected) continue
+
+    if (!unitsEquivalent(candidate.unit, expected.unit)) {
+      best = Math.max(best, -5)
+      continue
+    }
+
+    if (
+      (expectedType === 'number' ||
+        expectedType === 'fraction' ||
+        expectedType === 'percent') &&
+      'numeric' in candidate &&
+      'numeric' in expected
+    ) {
+      const candVal =
+        candidate.kind === 'percent' ? candidate.numeric / 100 : candidate.numeric
+      const expVal =
+        expected.kind === 'percent' ? expected.numeric / 100 : expected.numeric
+
+      const denom = Math.max(Math.abs(expVal), 1)
+      const relErr = Math.abs(candVal - expVal) / denom
+      const prefix = commonPrefixLength(candidate.normalized, expected.normalized)
+      const prefixBonus = Math.min(prefix, 8) * 0.08
+      const score = 1.2 - Math.min(relErr, 2) + prefixBonus
+      best = Math.max(best, score)
+      continue
+    }
+
+    const prefix = commonPrefixLength(candidate.normalized, expected.normalized)
+    const exact = candidate.normalized === expected.normalized ? 1 : 0
+    const score = exact ? 2 : prefix * 0.08
+    best = Math.max(best, score)
+  }
+
+  return best
+}
+
+function candidateRankScore(candidate: PersistedCandidate): number {
+  const confidence = Number(candidate?.confidence_score ?? 0)
+  const normalized = String(candidate?.normalized_value ?? '')
+  const rankPenalty = Math.min(Number((candidate as any)?.rank ?? 1), 50) * 0.001
+  const lengthBonus = Math.min(normalized.length, 12) * 0.01
+  return confidence + lengthBonus - rankPenalty
+}
+
+function chooseFallbackCandidate(
+  candidates: PersistedCandidate[],
+  expectedValues: string[],
+  expectedType: string
+): PersistedCandidate | null {
+  if (!Array.isArray(candidates) || candidates.length === 0) return null
+
+  const scored = [...candidates].map((candidate) => {
+    const candidateRaw =
+      asNullableText((candidate as any).normalized_value) ??
+      asNullableText((candidate as any).raw_text) ??
+      ''
+
+    const approx = candidateRaw
+      ? approximateSimilarity(candidateRaw, expectedValues, expectedType)
+      : -999
+
+    return {
+      candidate,
+      score: approx * 10 + candidateRankScore(candidate),
+    }
+  })
+
+  scored.sort((a, b) => b.score - a.score)
+  return scored[0]?.candidate ?? null
+}
+
+function chooseMatchedCandidate(
+  candidates: PersistedCandidate[],
+  expectedValues: string[],
+  expectedType: string,
+  tolerance: number
+): PersistedCandidate | null {
+  const matched = candidates.filter((candidate) => {
+    const candidateRaw =
+      asNullableText((candidate as any).normalized_value) ??
+      asNullableText((candidate as any).raw_text) ??
+      ''
+
+    if (!candidateRaw) return false
+
+    return matchCandidateAgainstExpected(candidateRaw, expectedValues, expectedType, tolerance)
+  })
+
+  if (matched.length === 0) return null
+
+  const sorted = [...matched].sort((a, b) => candidateRankScore(b) - candidateRankScore(a))
+  return sorted[0] ?? null
+}
+
 export async function gradeMathAnswer({
   ctx: _ctx,
   roi,
   candidates,
   answerKeyItem,
 }: GradeMathAnswerArgs): Promise<GradeMathAnswerResult> {
-  const best = chooseBestCandidate(candidates)
+  const expectedValues = answersFromKey(answerKeyItem)
+  const expectedType = detectExpectedAnswerType(roi, answerKeyItem, expectedValues)
+  const tolerance = normalizeExpectedTolerance(answerKeyItem)
 
-  if (!best) {
+  if (!Array.isArray(candidates) || candidates.length === 0) {
     return {
       auto_score: 0,
       match_score: 0,
@@ -401,17 +509,12 @@ export async function gradeMathAnswer({
       selected_candidate_id: null,
       selected_candidate_text: null,
       selected_candidate_normalized: null,
-      expected_answer: null,
-      expected_type: null,
+      expected_answer: expectedValues[0] ?? null,
+      expected_type: expectedType,
     }
   }
 
-  const expectedValues = answersFromKey(answerKeyItem)
-  const expectedType = detectExpectedAnswerType(roi, answerKeyItem, expectedValues)
-  const tolerance = normalizeExpectedTolerance(answerKeyItem)
-
-  const selectedCandidateText = asNullableText((best as any).raw_text)
-  const selectedCandidateNormalized = asNullableText((best as any).normalized_value)
+  const fallback = chooseFallbackCandidate(candidates, expectedValues, expectedType)
 
   if (!answerKeyItem || expectedValues.length === 0) {
     return {
@@ -419,32 +522,36 @@ export async function gradeMathAnswer({
       match_score: 0,
       matched: false,
       reason: 'no_answer_key',
-      selected_candidate_id: (best as any).id ?? null,
-      selected_candidate_text: selectedCandidateText,
-      selected_candidate_normalized: selectedCandidateNormalized,
+      selected_candidate_id: fallback?.id ?? null,
+      selected_candidate_text: asNullableText(fallback?.raw_text),
+      selected_candidate_normalized: asNullableText(fallback?.normalized_value),
       expected_answer: null,
       expected_type: expectedType,
     }
   }
 
-  const candidateRaw = selectedCandidateNormalized ?? selectedCandidateText ?? ''
-  const matched = matchCandidateAgainstExpected(
-    candidateRaw,
+  const matchedCandidate = chooseMatchedCandidate(
+    candidates,
     expectedValues,
     expectedType,
     tolerance
   )
 
+  const selected =
+    matchedCandidate ??
+    chooseFallbackCandidate(candidates, expectedValues, expectedType)
+
   const scoreWeight = computeScoreWeight(roi, answerKeyItem)
+  const matched = Boolean(matchedCandidate)
 
   return {
     auto_score: matched ? scoreWeight : 0,
     match_score: matched ? 1 : 0,
     matched,
     reason: matched ? 'matched' : 'not_matched',
-    selected_candidate_id: (best as any).id ?? null,
-    selected_candidate_text: selectedCandidateText,
-    selected_candidate_normalized: selectedCandidateNormalized,
+    selected_candidate_id: selected?.id ?? null,
+    selected_candidate_text: asNullableText(selected?.raw_text),
+    selected_candidate_normalized: asNullableText(selected?.normalized_value),
     expected_answer: expectedValues[0] ?? null,
     expected_type: expectedType,
   }

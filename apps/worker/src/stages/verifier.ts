@@ -33,8 +33,17 @@ function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value))
 }
 
-function bestCandidateConfidence(candidates: PersistedCandidate[]): number {
+function confidenceOfSelectedCandidate(
+  candidates: PersistedCandidate[],
+  selectedCandidateId: string | null
+): number {
   if (!Array.isArray(candidates) || candidates.length === 0) return 0
+
+  if (selectedCandidateId) {
+    const found = candidates.find((c) => String(c.id) === String(selectedCandidateId))
+    if (found) return clamp01(Number(found.confidence_score ?? 0))
+  }
+
   return clamp01(Number(candidates[0]?.confidence_score ?? 0))
 }
 
@@ -58,7 +67,7 @@ export async function verifyAndFinalize({
   const gamma = 0.3
 
   const c1 = deterministicScore(grade)
-  const c2 = bestCandidateConfidence(candidates)
+  const c2 = confidenceOfSelectedCandidate(candidates, grade?.selected_candidate_id ?? null)
   const m = binaryMatchedScore(grade)
 
   const final_confidence = clamp01(alpha * c1 + beta * c2 + gamma * m)
@@ -67,8 +76,6 @@ export async function verifyAndFinalize({
   const decision: 'auto_graded' | 'needs_review' =
     final_confidence >= threshold ? 'auto_graded' : 'needs_review'
 
-  const best = Array.isArray(candidates) && candidates.length > 0 ? candidates[0] : null
-
   return {
     alpha,
     beta,
@@ -76,10 +83,9 @@ export async function verifyAndFinalize({
     final_confidence,
     threshold,
     decision,
-    selected_candidate_text: best?.raw_text ?? grade?.selected_candidate_text ?? null,
-    selected_candidate_normalized:
-      best?.normalized_value ?? grade?.selected_candidate_normalized ?? null,
-    selected_candidate_id: best?.id ?? grade?.selected_candidate_id ?? null,
+    selected_candidate_text: grade?.selected_candidate_text ?? null,
+    selected_candidate_normalized: grade?.selected_candidate_normalized ?? null,
+    selected_candidate_id: grade?.selected_candidate_id ?? null,
     verifier_used: true,
     review_required: decision === 'needs_review',
     auto_score: Number(grade?.auto_score ?? 0),

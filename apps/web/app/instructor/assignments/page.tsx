@@ -225,6 +225,13 @@ export default function InstructorAssignmentsPage() {
 
         <div className="flex flex-wrap gap-3">
           <Link
+            href="/instructor/review"
+            className="px-4 py-2 rounded-lg bg-red-600 text-white font-bold hover:bg-red-700 transition-colors"
+          >
+            Review Queue
+          </Link>
+
+          <Link
             href="/instructor/dashboard"
             className="px-4 py-2 rounded-lg bg-slate-100 text-slate-700 font-semibold hover:bg-slate-200 transition-colors"
           >
@@ -255,11 +262,20 @@ export default function InstructorAssignmentsPage() {
       <section className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <StatCard title="Assignments" value={String(stats.assignment_count)} />
         <StatCard title="Submissions" value={String(stats.submission_count)} />
-        <StatCard
-          title="Needs Review"
-          value={String(stats.needs_review_count)}
-          valueClassName="text-red-600"
-        />
+
+        <Link
+          href="/instructor/review"
+          className="block rounded-xl border border-red-200 bg-white p-5 shadow-sm hover:bg-red-50 hover:border-red-300 transition-colors"
+        >
+          <div className="text-sm text-slate-500 font-medium">Needs Review</div>
+          <div className="text-3xl font-extrabold mt-2 text-red-600">
+            {stats.needs_review_count}
+          </div>
+          <div className="mt-3 text-sm font-semibold text-red-700">
+            Open Review Queue →
+          </div>
+        </Link>
+
         <StatCard
           title="Avg Score"
           value={stats.avg_total_score.toFixed(2)}
@@ -331,8 +347,15 @@ export default function InstructorAssignmentsPage() {
       </section>
 
       <section className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="p-5 border-b border-slate-200 bg-slate-50">
+        <div className="p-5 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
           <div className="font-bold text-slate-900 text-lg">Assignment List</div>
+
+          <Link
+            href="/instructor/review"
+            className="text-sm font-semibold text-red-600 hover:text-red-700"
+          >
+            เปิด Review Queue
+          </Link>
         </div>
 
         <div className="overflow-x-auto">
@@ -356,6 +379,7 @@ export default function InstructorAssignmentsPage() {
               {filteredItems.map((item) => {
                 const isBusy = actingId === item.id
                 const hasSubmissions = Number(item.submission_count ?? 0) > 0
+                const hasNeedsReview = Number(item.needs_review_count ?? 0) > 0
 
                 return (
                   <tr key={item.id} className="hover:bg-slate-50 transition-colors">
@@ -386,9 +410,18 @@ export default function InstructorAssignmentsPage() {
                       {item.submission_count ?? 0}
                     </td>
 
-                    <td className="p-4 text-right font-semibold text-red-600">
-                      {item.needs_review_count ?? 0}
-                    </td>
+                   <td className="p-4 text-right">
+  {Number(item.needs_review_count ?? 0) > 0 ? (
+    <Link
+      href="/instructor/review"
+      className="inline-flex rounded-lg bg-red-100 px-3 py-1.5 text-sm font-bold text-red-700 hover:bg-red-200"
+    >
+      {item.needs_review_count}
+    </Link>
+  ) : (
+    <span className="font-semibold text-red-600">{item.needs_review_count ?? 0}</span>
+  )}
+</td>
 
                     <td className="p-4 text-right font-semibold text-blue-600">
                       {Number(item.avg_total_score ?? 0).toFixed(2)}
@@ -396,6 +429,16 @@ export default function InstructorAssignmentsPage() {
 
                     <td className="p-4">
                       <div className="flex justify-end gap-2 flex-wrap">
+                        
+                        {hasNeedsReview && (
+                          <Link
+                            href="/instructor/review"
+                            className="px-3 py-1.5 rounded-lg bg-red-600 text-white text-xs font-semibold hover:bg-red-700"
+                          >
+                            Review
+                          </Link>
+                        )}
+
                         <Link
                           href={`/instructor/assignments/${item.id}`}
                           className="px-3 py-1.5 rounded-lg bg-slate-900 text-white text-xs font-semibold hover:bg-slate-800"

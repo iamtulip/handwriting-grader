@@ -25,6 +25,10 @@ export type WorkerLayoutRegion = {
   score_weight?: number | null
   bbox_norm?: [number, number, number, number] | number[] | null
   bbox?: [number, number, number, number] | number[] | null
+  x_norm?: number | null
+  y_norm?: number | null
+  w_norm?: number | null
+  h_norm?: number | null
 }
 
 export type WorkerLayoutPage = {
@@ -61,6 +65,8 @@ export type WorkerLayoutSpec = {
   version: number
   spec_name?: string | null
   layout_status?: string | null
+  is_active?: boolean | null
+  updated_at?: string | null
   layout_data: WorkerLayoutData
 }
 
@@ -79,13 +85,29 @@ function ensureArray<T = any>(value: unknown): T[] {
   return Array.isArray(value) ? (value as T[]) : []
 }
 
-function pickLatestLayoutSpec(rows: any[]): WorkerLayoutSpec | null {
+function pickPreferredLayoutSpec(rows: any[]): WorkerLayoutSpec | null {
   if (!Array.isArray(rows) || rows.length === 0) return null
 
-  const sorted = [...rows].sort(
-    (a, b) => Number(b.version ?? 0) - Number(a.version ?? 0)
-  )
-  const row = sorted[0]
+  const scored = [...rows].sort((a, b) => {
+    const aApproved = a?.layout_status === 'approved' ? 1 : 0
+    const bApproved = b?.layout_status === 'approved' ? 1 : 0
+    if (aApproved !== bApproved) return bApproved - aApproved
+
+    const aActive = a?.is_active ? 1 : 0
+    const bActive = b?.is_active ? 1 : 0
+    if (aActive !== bActive) return bActive - aActive
+
+    const aVersion = Number(a?.version ?? 0)
+    const bVersion = Number(b?.version ?? 0)
+    if (aVersion !== bVersion) return bVersion - aVersion
+
+    const aUpdated = new Date(a?.updated_at ?? 0).getTime()
+    const bUpdated = new Date(b?.updated_at ?? 0).getTime()
+    return bUpdated - aUpdated
+  })
+
+  const row = scored[0]
+  if (!row) return null
 
   return {
     id: row.id,
@@ -93,6 +115,8 @@ function pickLatestLayoutSpec(rows: any[]): WorkerLayoutSpec | null {
     version: Number(row.version ?? 1),
     spec_name: row.spec_name ?? null,
     layout_status: row.layout_status ?? null,
+    is_active: row.is_active ?? null,
+    updated_at: row.updated_at ?? null,
     layout_data: (row.layout_data ?? { pages: [] }) as WorkerLayoutData,
   }
 }
@@ -211,14 +235,14 @@ export async function loadContext(submissionId: string): Promise<WorkerContext> 
 
   const { data: layoutSpecs, error: layoutError } = await supabase
     .from('assignment_layout_specs')
-    .select('id, assignment_id, version, spec_name, layout_status, layout_data')
+    .select('id, assignment_id, version, spec_name, layout_status, is_active, updated_at, layout_data')
     .eq('assignment_id', submission.assignment_id)
 
   if (layoutError) {
     throw new Error(`Failed to load assignment_layout_specs: ${layoutError.message}`)
   }
 
-  const layoutSpec = pickLatestLayoutSpec(layoutSpecs ?? [])
+  const layoutSpec = pickPreferredLayoutSpec(layoutSpecs ?? [])
   if (!layoutSpec) {
     throw new Error(`No layout spec found for assignment ${submission.assignment_id}`)
   }
@@ -253,6 +277,8 @@ export async function loadContext(submissionId: string): Promise<WorkerContext> 
       version: Number(layoutSpec.version ?? 1),
       spec_name: layoutSpec.spec_name ?? null,
       layout_status: layoutSpec.layout_status ?? null,
+      is_active: layoutSpec.is_active ?? null,
+      updated_at: layoutSpec.updated_at ?? null,
       layout_data: layoutSpec.layout_data ?? { pages: [] },
     },
     answerKey: {
