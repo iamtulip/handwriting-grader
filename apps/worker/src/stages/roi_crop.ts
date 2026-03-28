@@ -18,6 +18,31 @@ export type RoiCrop = {
   crop_storage_path?: string | null
 }
 
+type GrayPage = {
+  width: number
+  height: number
+  data: Buffer
+}
+
+type PxBox = {
+  left: number
+  top: number
+  right: number
+  bottom: number
+  width: number
+  height: number
+}
+
+type InkComponent = {
+  left: number
+  top: number
+  right: number
+  bottom: number
+  area: number
+  cx: number
+  cy: number
+}
+
 function asNumber(value: unknown, fallback = 0): number {
   const n = Number(value)
   return Number.isFinite(n) ? n : fallback
@@ -36,14 +61,21 @@ function clamp01(value: number): number {
   return value
 }
 
+function clampInt(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value))
+}
+
+function median(values: number[]): number {
+  if (values.length === 0) return 0
+  const arr = [...values].sort((a, b) => a - b)
+  const mid = Math.floor(arr.length / 2)
+  return arr.length % 2 === 0 ? (arr[mid - 1] + arr[mid]) / 2 : arr[mid]
+}
+
 function normalizeRoiId(region: any): string {
   return String(region?.roi_id ?? region?.id ?? crypto.randomUUID())
 }
 
-/**
- * Layout editor stores bbox_norm as [x1, y1, x2, y2]
- * Worker converts it to [x, y, w, h]
- */
 function normalizeBBox(region: any): [number, number, number, number] | null {
   if (
     region?.x_norm != null &&
@@ -83,7 +115,6 @@ function normalizeBBox(region: any): [number, number, number, number] | null {
   const h = y2 - y1
 
   if (w <= 0 || h <= 0) return null
-
   return [x1, y1, w, h]
 }
 
@@ -101,7 +132,6 @@ function pageRegionsFromLayout(ctx: WorkerContext, pageNumber: number): any[] {
   )
 
   if (!pageSpec) return []
-
   return Array.isArray(pageSpec.regions) ? pageSpec.regions : []
 }
 
@@ -116,6 +146,38 @@ function compareRoiOrder(a: RoiCrop, b: RoiCrop): number {
   return String(a.roi_id).localeCompare(String(b.roi_id))
 }
 
+function buildInitialRois(ctx: WorkerContext, pageNumber: number): RoiCrop[] {
+  const regions = pageRegionsFromLayout(ctx, pageNumber)
+
+  return regions
+    .filter((region: any) =>
+      ['answer', 'table_cell', 'working'].includes(String(region?.kind ?? 'answer'))
+    )
+    .map((region: any) => {
+      const bbox = normalizeBBox(region)
+
+      return {
+        roi_id: normalizeRoiId(region),
+        page_number: Number(pageNumber),
+        kind: String(region?.kind ?? 'answer'),
+        item_no: asNullableString(region?.item_no),
+        question_no: asNullableString(region?.question_no),
+        answer_type: asNullableString(region?.answer_type ?? region?.kind ?? 'text'),
+        points: region?.points != null ? asNumber(region.points, 0) : null,
+        score_weight:
+          region?.score_weight != null
+            ? asNumber(region.score_weight, 1)
+            : region?.points != null
+              ? asNumber(region.points, 1)
+              : 1,
+        bbox_norm: bbox,
+        crop_storage_path: null,
+      }
+    })
+    .filter((roi) => roi.bbox_norm !== null)
+    .sort(compareRoiOrder)
+}
+
 async function downloadPageBuffer(storagePath: string): Promise<Buffer> {
   const { data, error } = await supabase.storage
     .from(SUBMISSION_BUCKET)
@@ -126,87 +188,6 @@ async function downloadPageBuffer(storagePath: string): Promise<Buffer> {
   }
 
   return Buffer.from(await data.arrayBuffer())
-}
-
-function median(values: number[]): number {
-  if (values.length === 0) return 0
-  const sorted = [...values].sort((a, b) => a - b)
-  const mid = Math.floor(sorted.length / 2)
-  if (sorted.length % 2 === 0) return (sorted[mid - 1] + sorted[mid]) / 2
-  return sorted[mid]
-}
-
-function buildAnswerColumnBounds(rois: RoiCrop[]): [number, number] | null {
-  const xs1 = rois
-    .map((r) => r.bbox_norm?.[0] ?? null)
-    .filter((v): v is number => v != null)
-
-  const xs2 = rois
-    .map((r) => {
-      const b = r.bbox_norm
-      return b ? b[0] + b[2] : null
-    })
-    .filter((v): v is number => v != null)
-
-  if (xs1.length === 0 || xs2.length === 0) return null
-
-  const left = median(xs1)
-  const right = median(xs2)
-
-  if (right <= left) return null
-
-  const width = right - left
-  return [
-    clamp01(left - width * 0.04),
-    clamp01(right + width * 0.04),
-  ]
-}
-
-function buildRowBands(
-  rois: RoiCrop[]
-): Array<{ top: number; bottom: number }> {
-  const bands: Array<{ top: number; bottom: number }> = []
-
-  for (let i = 0; i < rois.length; i += 1) {
-    const current = rois[i].bbox_norm
-    if (!current) {
-      bands.push({ top: 0, bottom: 1 })
-      continue
-    }
-
-    const currentTop = current[1]
-    const currentBottom = current[1] + current[3]
-    const currentCenter = currentTop + current[3] / 2
-
-    const prev = i > 0 ? rois[i - 1].bbox_norm : null
-    const next = i < rois.length - 1 ? rois[i + 1].bbox_norm : null
-
-    const prevCenter = prev ? prev[1] + prev[3] / 2 : null
-    const nextCenter = next ? next[1] + next[3] / 2 : null
-
-    const top =
-      prevCenter != null
-        ? (prevCenter + currentCenter) / 2
-        : Math.max(0, currentTop - current[3] * 0.45)
-
-    const bottom =
-      nextCenter != null
-        ? (nextCenter + currentCenter) / 2
-        : Math.min(1, currentBottom + current[3] * 0.45)
-
-    bands.push({
-      top: clamp01(top),
-      bottom: clamp01(bottom),
-    })
-  }
-
-  return bands
-}
-
-type GrayPage = {
-  width: number
-  height: number
-  data: Buffer
 }
 
 async function loadGrayPage(pageBuffer: Buffer): Promise<GrayPage> {
@@ -229,104 +210,47 @@ function pixelAt(gray: GrayPage, x: number, y: number): number {
   return gray.data[idx] ?? 255
 }
 
-function snapInkBoxWithinSearch(
+function normToPx(gray: GrayPage, bbox: [number, number, number, number]): PxBox {
+  const [x, y, w, h] = bbox
+
+  const left = clampInt(Math.floor(x * gray.width), 0, gray.width - 1)
+  const top = clampInt(Math.floor(y * gray.height), 0, gray.height - 1)
+  const right = clampInt(Math.ceil((x + w) * gray.width), left + 1, gray.width)
+  const bottom = clampInt(Math.ceil((y + h) * gray.height), top + 1, gray.height)
+
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    width: Math.max(1, right - left),
+    height: Math.max(1, bottom - top),
+  }
+}
+
+function pxToNorm(
   gray: GrayPage,
-  search: [number, number, number, number]
-): [number, number, number, number] | null {
-  const [sx, sy, sw, sh] = search
-
-  const left = Math.max(0, Math.floor(sx * gray.width))
-  const top = Math.max(0, Math.floor(sy * gray.height))
-  const right = Math.min(gray.width, Math.ceil((sx + sw) * gray.width))
-  const bottom = Math.min(gray.height, Math.ceil((sy + sh) * gray.height))
-
-  const width = right - left
-  const height = bottom - top
-
-  if (width <= 3 || height <= 3) return null
-
-  const rowDark = new Array<number>(height).fill(0)
-  const colDark = new Array<number>(width).fill(0)
-
-  const darkThreshold = 170
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const value = pixelAt(gray, left + x, top + y)
-      if (value < darkThreshold) {
-        rowDark[y] += 1
-        colDark[x] += 1
-      }
-    }
-  }
-
-  const rowDensity = rowDark.map((v) => v / width)
-  const colDensity = colDark.map((v) => v / height)
-
-  let minX = Number.POSITIVE_INFINITY
-  let minY = Number.POSITIVE_INFINITY
-  let maxX = Number.NEGATIVE_INFINITY
-  let maxY = Number.NEGATIVE_INFINITY
-  let inkCount = 0
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const value = pixelAt(gray, left + x, top + y)
-      if (value >= darkThreshold) continue
-
-      const rd = rowDensity[y]
-      const cd = colDensity[x]
-
-      // ตัดเส้นตารางยาว ๆ ออก
-      if (rd > 0.82 || cd > 0.82) continue
-
-      // ต้องมีความหนาแน่นอย่างน้อยเล็กน้อย
-      if (rd < 0.01 && cd < 0.01) continue
-
-      inkCount += 1
-      if (x < minX) minX = x
-      if (y < minY) minY = y
-      if (x > maxX) maxX = x
-      if (y > maxY) maxY = y
-    }
-  }
-
-  if (inkCount < 12) return null
-  if (!Number.isFinite(minX) || !Number.isFinite(minY)) return null
-
-  const boxW = maxX - minX + 1
-  const boxH = maxY - minY + 1
-
-  const padX = Math.max(3, Math.round(boxW * 0.18))
-  const padY = Math.max(3, Math.round(boxH * 0.28))
-
-  const finalLeft = Math.max(0, left + minX - padX)
-  const finalTop = Math.max(0, top + minY - padY)
-  const finalRight = Math.min(gray.width, left + maxX + 1 + padX)
-  const finalBottom = Math.min(gray.height, top + maxY + 1 + padY)
-
-  const finalW = finalRight - finalLeft
-  const finalH = finalBottom - finalTop
-
-  if (finalW <= 3 || finalH <= 3) return null
-
+  left: number,
+  top: number,
+  right: number,
+  bottom: number
+): [number, number, number, number] {
   return [
-    finalLeft / gray.width,
-    finalTop / gray.height,
-    finalW / gray.width,
-    finalH / gray.height,
+    left / gray.width,
+    top / gray.height,
+    Math.max(1, right - left) / gray.width,
+    Math.max(1, bottom - top) / gray.height,
   ]
 }
 
-function applyFallbackInset(
+function insetNormBox(
   bbox: [number, number, number, number],
-  kind: string
+  insetXRatio: number,
+  insetYRatio: number
 ): [number, number, number, number] {
   const [x, y, w, h] = bbox
-  const isAnswerLike = ['answer', 'table_cell'].includes(kind)
-
-  const insetX = w * (isAnswerLike ? 0.035 : 0.01)
-  const insetY = h * (isAnswerLike ? 0.14 : 0.03)
+  const insetX = w * insetXRatio
+  const insetY = h * insetYRatio
 
   const nx = clamp01(x + insetX)
   const ny = clamp01(y + insetY)
@@ -336,31 +260,509 @@ function applyFallbackInset(
   return [nx, ny, nw, nh]
 }
 
-function buildSearchBox(
-  current: [number, number, number, number],
-  band: { top: number; bottom: number },
-  answerColumn: [number, number] | null
+function fallbackInset(
+  bbox: [number, number, number, number]
 ): [number, number, number, number] {
-  const [x, y, w, h] = current
+  return insetNormBox(bbox, 0.03, 0.10)
+}
 
-  const fallbackX1 = clamp01(x)
-  const fallbackX2 = clamp01(x + w)
+function buildAnswerColumnRange(rois: RoiCrop[]): [number, number] | null {
+  const lefts: number[] = []
+  const rights: number[] = []
 
-  const colLeft = answerColumn ? answerColumn[0] : fallbackX1
-  const colRight = answerColumn ? answerColumn[1] : fallbackX2
+  for (const roi of rois) {
+    if (!roi.bbox_norm) continue
+    lefts.push(roi.bbox_norm[0])
+    rights.push(roi.bbox_norm[0] + roi.bbox_norm[2])
+  }
 
-  const searchX1 = clamp01(Math.min(colLeft, fallbackX1) + 0.006)
-  const searchX2 = clamp01(Math.max(colRight, fallbackX2) - 0.006)
+  if (lefts.length === 0 || rights.length === 0) return null
 
-  const searchTop = clamp01(Math.min(band.top, y))
-  const searchBottom = clamp01(Math.max(band.bottom, y + h))
+  const left = median(lefts)
+  const right = median(rights)
+
+  if (right <= left) return null
+
+  const width = right - left
 
   return [
-    searchX1,
-    searchTop,
-    Math.max(0.001, searchX2 - searchX1),
-    Math.max(0.001, searchBottom - searchTop),
+    clamp01(left - width * 0.03),
+    clamp01(right + width * 0.03),
   ]
+}
+
+function detectVerticalDarkLines(
+  gray: GrayPage,
+  xStart: number,
+  xEnd: number
+): number[] {
+  const densities: number[] = new Array(gray.width).fill(0)
+
+  for (let x = xStart; x < xEnd; x += 1) {
+    let dark = 0
+    for (let y = 0; y < gray.height; y += 1) {
+      if (pixelAt(gray, x, y) < 150) dark += 1
+    }
+    densities[x] = dark / gray.height
+  }
+
+  const raw: number[] = []
+  let clusterStart = -1
+
+  for (let x = xStart; x < xEnd; x += 1) {
+    if (densities[x] >= 0.35) {
+      if (clusterStart < 0) clusterStart = x
+    } else if (clusterStart >= 0) {
+      raw.push(Math.round((clusterStart + x - 1) / 2))
+      clusterStart = -1
+    }
+  }
+
+  if (clusterStart >= 0) raw.push(Math.round((clusterStart + xEnd - 1) / 2))
+
+  const merged: number[] = []
+  for (const p of raw) {
+    const last = merged[merged.length - 1]
+    if (last == null || Math.abs(last - p) > 8) {
+      merged.push(p)
+    } else {
+      merged[merged.length - 1] = Math.round((last + p) / 2)
+    }
+  }
+
+  return merged
+}
+
+function detectHorizontalTableLines(
+  gray: GrayPage,
+  answerColumnPx: [number, number] | null
+): number[] {
+  const scanX1 = answerColumnPx
+    ? clampInt(answerColumnPx[0], 0, gray.width - 1)
+    : Math.floor(gray.width * 0.55)
+
+  const scanX2 = answerColumnPx
+    ? clampInt(answerColumnPx[1], scanX1 + 1, gray.width)
+    : Math.floor(gray.width * 0.95)
+
+  const densities: number[] = new Array(gray.height).fill(0)
+
+  for (let y = 0; y < gray.height; y += 1) {
+    let dark = 0
+    for (let x = scanX1; x < scanX2; x += 1) {
+      if (pixelAt(gray, x, y) < 150) dark += 1
+    }
+    densities[y] = dark / Math.max(1, scanX2 - scanX1)
+  }
+
+  const raw: number[] = []
+  let clusterStart = -1
+
+  for (let y = 0; y < densities.length; y += 1) {
+    if (densities[y] >= 0.45) {
+      if (clusterStart < 0) clusterStart = y
+    } else if (clusterStart >= 0) {
+      raw.push(Math.round((clusterStart + y - 1) / 2))
+      clusterStart = -1
+    }
+  }
+
+  if (clusterStart >= 0) {
+    raw.push(Math.round((clusterStart + densities.length - 1) / 2))
+  }
+
+  const merged: number[] = []
+  for (const p of raw) {
+    const last = merged[merged.length - 1]
+    if (last == null || Math.abs(last - p) > 6) {
+      merged.push(p)
+    } else {
+      merged[merged.length - 1] = Math.round((last + p) / 2)
+    }
+  }
+
+  return merged
+}
+
+function nearestLineAbove(lines: number[], y: number): number | null {
+  let best: number | null = null
+  for (const line of lines) {
+    if (line <= y) best = line
+    else break
+  }
+  return best
+}
+
+function nearestLineBelow(lines: number[], y: number): number | null {
+  for (const line of lines) {
+    if (line >= y) return line
+  }
+  return null
+}
+
+/**
+ * เปลี่ยนจากใช้ cy ล้วน ๆ มาใช้ช่วง overlap กับ row cell จริง
+ */
+function findBestRowWindow(
+  px: PxBox,
+  rowLines: number[]
+): { top: number; bottom: number } | null {
+  if (rowLines.length < 2) return null
+
+  let best: { top: number; bottom: number } | null = null
+  let bestScore = -Infinity
+
+  const roiTop = px.top
+  const roiBottom = px.bottom
+  const roiCenter = (roiTop + roiBottom) / 2
+
+  for (let i = 0; i < rowLines.length - 1; i += 1) {
+    const rowTop = rowLines[i]
+    const rowBottom = rowLines[i + 1]
+    if (rowBottom <= rowTop) continue
+
+    const overlap = Math.max(0, Math.min(roiBottom, rowBottom) - Math.max(roiTop, rowTop))
+    const rowCenter = (rowTop + rowBottom) / 2
+    const centerDist = Math.abs(roiCenter - rowCenter)
+    const rowHeight = rowBottom - rowTop
+
+    const score =
+      overlap * 3 -
+      centerDist * 1.2 -
+      Math.abs(rowHeight - px.height) * 0.2
+
+    if (score > bestScore) {
+      bestScore = score
+      best = { top: rowTop, bottom: rowBottom }
+    }
+  }
+
+  return best
+}
+
+function snapRoiToDetectedRow(
+  gray: GrayPage,
+  bbox: [number, number, number, number],
+  rowLines: number[],
+  answerColumnPx: [number, number] | null
+): [number, number, number, number] {
+  const px = normToPx(gray, bbox)
+
+  const rowWindow = findBestRowWindow(px, rowLines)
+  const topLine = rowWindow?.top ?? nearestLineAbove(rowLines, Math.round((px.top + px.bottom) / 2))
+  const bottomLine = rowWindow?.bottom ?? nearestLineBelow(rowLines, Math.round((px.top + px.bottom) / 2))
+
+  const colLeft = answerColumnPx ? answerColumnPx[0] : px.left
+  const colRight = answerColumnPx ? answerColumnPx[1] : px.right
+
+  const colInset = Math.max(8, Math.floor((colRight - colLeft) * 0.04))
+  const left = clampInt(colLeft + colInset, 0, gray.width - 2)
+  const right = clampInt(colRight - colInset, left + 1, gray.width)
+
+  const rowHeight = topLine != null && bottomLine != null ? Math.max(1, bottomLine - topLine) : px.height
+
+  const top = topLine != null
+    ? clampInt(topLine + Math.max(6, Math.floor(rowHeight * 0.14)), 0, gray.height - 2)
+    : clampInt(px.top + Math.max(4, Math.floor(px.height * 0.08)), 0, gray.height - 2)
+
+  const bottom = bottomLine != null
+    ? clampInt(bottomLine - Math.max(6, Math.floor(rowHeight * 0.16)), top + 1, gray.height)
+    : clampInt(px.bottom - Math.max(4, Math.floor(px.height * 0.08)), top + 1, gray.height)
+
+  if (right <= left + 5 || bottom <= top + 5) {
+    return bbox
+  }
+
+  return pxToNorm(gray, left, top, right, bottom)
+}
+
+function isBorderLikeComponent(c: InkComponent, cell: PxBox): boolean {
+  const w = c.right - c.left
+  const h = c.bottom - c.top
+
+  if (w > cell.width * 0.72 && h <= 5) return true
+  if (h > cell.height * 0.72 && w <= 5) return true
+
+  const touchesLeft = c.left <= cell.left + 1
+  const touchesRight = c.right >= cell.right - 1
+  const touchesTop = c.top <= cell.top + 1
+  const touchesBottom = c.bottom >= cell.bottom - 1
+
+  if ((touchesLeft || touchesRight) && h > cell.height * 0.55 && w <= 8) return true
+  if ((touchesTop || touchesBottom) && w > cell.width * 0.55 && h <= 8) return true
+
+  return false
+}
+
+function findInkComponentsInBox(
+  gray: GrayPage,
+  bbox: [number, number, number, number]
+): InkComponent[] {
+  const px = normToPx(gray, bbox)
+  const visited = new Uint8Array(px.width * px.height)
+  const components: InkComponent[] = []
+  const darkThreshold = 180
+
+  const isDark = (x: number, y: number) => pixelAt(gray, x, y) < darkThreshold
+  const idx = (x: number, y: number) => (y - px.top) * px.width + (x - px.left)
+
+  for (let y = px.top; y < px.bottom; y += 1) {
+    for (let x = px.left; x < px.right; x += 1) {
+      const i = idx(x, y)
+      if (visited[i]) continue
+      visited[i] = 1
+
+      if (!isDark(x, y)) continue
+
+      const queue: Array<[number, number]> = [[x, y]]
+      let q = 0
+
+      let minX = x
+      let minY = y
+      let maxX = x
+      let maxY = y
+      let area = 0
+      let sumX = 0
+      let sumY = 0
+
+      while (q < queue.length) {
+        const [cx, cy] = queue[q++]
+        area += 1
+        sumX += cx
+        sumY += cy
+
+        if (cx < minX) minX = cx
+        if (cx > maxX) maxX = cx
+        if (cy < minY) minY = cy
+        if (cy > maxY) maxY = cy
+
+        const neighbors: Array<[number, number]> = [
+          [cx - 1, cy],
+          [cx + 1, cy],
+          [cx, cy - 1],
+          [cx, cy + 1],
+          [cx - 1, cy - 1],
+          [cx + 1, cy - 1],
+          [cx - 1, cy + 1],
+          [cx + 1, cy + 1],
+        ]
+
+        for (const [nx, ny] of neighbors) {
+          if (nx < px.left || nx >= px.right || ny < px.top || ny >= px.bottom) continue
+          const ni = idx(nx, ny)
+          if (visited[ni]) continue
+          visited[ni] = 1
+          if (!isDark(nx, ny)) continue
+          queue.push([nx, ny])
+        }
+      }
+
+      if (area < 10) continue
+
+      const comp: InkComponent = {
+        left: minX,
+        top: minY,
+        right: maxX + 1,
+        bottom: maxY + 1,
+        area,
+        cx: sumX / area,
+        cy: sumY / area,
+      }
+
+      if (isBorderLikeComponent(comp, px)) continue
+
+      const w = comp.right - comp.left
+      const h = comp.bottom - comp.top
+      if (w <= 3 && h <= 3) continue
+
+      components.push(comp)
+    }
+  }
+
+  return components
+}
+
+/**
+ * เลือก handwriting blob แบบ bias ไปทางก้อนที่ “ครบ” มากกว่าก้อนเล็กเดี่ยว
+ */
+function chooseBestInkComponent(
+  components: InkComponent[],
+  gray: GrayPage,
+  bbox: [number, number, number, number]
+): InkComponent | null {
+  if (components.length === 0) return null
+
+  const px = normToPx(gray, bbox)
+  const targetCx = px.left + px.width * 0.55
+  const targetCy = px.top + px.height * 0.38
+
+  let best: InkComponent | null = null
+  let bestScore = -Infinity
+
+  for (const c of components) {
+    const w = c.right - c.left
+    const h = c.bottom - c.top
+    const centerDist = Math.hypot(c.cx - targetCx, c.cy - targetCy)
+
+    const highPenalty = c.cy < px.top + px.height * 0.08 ? 10 : 0
+    const lowPenalty = c.cy > px.top + px.height * 0.78 ? 16 : 0
+    const edgePenalty =
+      c.left <= px.left + 2 ||
+      c.right >= px.right - 2 ||
+      c.top <= px.top + 2 ||
+      c.bottom >= px.bottom - 2
+        ? 12
+        : 0
+
+    // bonus ถ้ากว้างพอจะเป็นเลขหลายหลัก
+    const widthBonus =
+      w >= px.width * 0.18 ? 8 :
+      w >= px.width * 0.10 ? 4 : 0
+
+    const heightBonus =
+      h >= px.height * 0.12 ? 4 : 0
+
+    const score =
+      c.area * 0.04 +
+      Math.min(w, 260) * 0.08 +
+      Math.min(h, 120) * 0.04 +
+      widthBonus +
+      heightBonus -
+      centerDist * 0.08 -
+      highPenalty -
+      lowPenalty -
+      edgePenalty
+
+    if (score > bestScore) {
+      bestScore = score
+      best = c
+    }
+  }
+
+  return best
+}
+
+function mergeComponents(components: InkComponent[]): InkComponent | null {
+  if (components.length === 0) return null
+
+  let left = Number.POSITIVE_INFINITY
+  let top = Number.POSITIVE_INFINITY
+  let right = Number.NEGATIVE_INFINITY
+  let bottom = Number.NEGATIVE_INFINITY
+  let area = 0
+  let sumX = 0
+  let sumY = 0
+
+  for (const c of components) {
+    left = Math.min(left, c.left)
+    top = Math.min(top, c.top)
+    right = Math.max(right, c.right)
+    bottom = Math.max(bottom, c.bottom)
+    area += c.area
+    sumX += c.cx * c.area
+    sumY += c.cy * c.area
+  }
+
+  return {
+    left,
+    top,
+    right,
+    bottom,
+    area,
+    cx: area > 0 ? sumX / area : 0,
+    cy: area > 0 ? sumY / area : 0,
+  }
+}
+
+function expandByNearbyComponents(
+  best: InkComponent,
+  components: InkComponent[],
+  cell: PxBox
+): InkComponent {
+  const selected: InkComponent[] = [best]
+  const bestW = best.right - best.left
+  const bestH = best.bottom - best.top
+
+  for (const c of components) {
+    if (c === best) continue
+
+    const horizontalGap =
+      c.left > best.right
+        ? c.left - best.right
+        : best.left > c.right
+          ? best.left - c.right
+          : 0
+
+    const verticalOverlap =
+      Math.max(
+        0,
+        Math.min(best.bottom, c.bottom) - Math.max(best.top, c.top)
+      )
+
+    const nearSameBand =
+      Math.abs(c.cy - best.cy) <= Math.max(18, bestH * 0.85)
+
+    const tinyPunctuation =
+      (c.right - c.left) <= 18 &&
+      (c.bottom - c.top) <= 18
+
+    const mediumNeighbor =
+      (c.right - c.left) >= 6 &&
+      horizontalGap <= Math.max(28, bestW * 0.55) &&
+      nearSameBand
+
+    const joinable =
+      mediumNeighbor ||
+      (tinyPunctuation && horizontalGap <= 28 && verticalOverlap >= 0)
+
+    if (joinable) {
+      if (c.cy > cell.top + cell.height * 0.82) continue
+      selected.push(c)
+    }
+  }
+
+  const merged = mergeComponents(selected)
+  return merged ?? best
+}
+
+function expandComponentBox(
+  gray: GrayPage,
+  c: InkComponent,
+  cellBox: [number, number, number, number]
+): [number, number, number, number] {
+  const cell = normToPx(gray, cellBox)
+
+  const w = c.right - c.left
+  const h = c.bottom - c.top
+
+  const padX = Math.max(12, Math.round(w * 0.24))
+  const padYTop = Math.max(10, Math.round(h * 0.35))
+  const padYBottom = Math.max(12, Math.round(h * 0.40))
+
+  const left = clampInt(c.left - padX, cell.left, cell.right - 1)
+  const right = clampInt(c.right + padX, left + 1, cell.right)
+  const top = clampInt(c.top - padYTop, cell.top, cell.bottom - 1)
+  const bottom = clampInt(c.bottom + padYBottom, top + 1, cell.bottom)
+
+  return pxToNorm(gray, left, top, right, bottom)
+}
+
+function deriveAnchoredCell(
+  gray: GrayPage,
+  roi: RoiCrop,
+  rowLines: number[],
+  answerColumnPx: [number, number] | null
+): [number, number, number, number] | null {
+  if (!roi.bbox_norm) return null
+
+  const snapped = snapRoiToDetectedRow(gray, roi.bbox_norm, rowLines, answerColumnPx)
+  const snappedPx = normToPx(gray, snapped)
+
+  if (snappedPx.height > Math.max(42, gray.height * 0.14)) {
+    return insetNormBox(snapped, 0.02, 0.18)
+  }
+
+  return snapped
 }
 
 export async function cropRoisForPage(
@@ -368,75 +770,81 @@ export async function cropRoisForPage(
   pageNumber: number,
   _alignment: any
 ): Promise<RoiCrop[]> {
-  const regions = pageRegionsFromLayout(ctx, pageNumber)
+  const initialRois = buildInitialRois(ctx, pageNumber)
+  if (initialRois.length === 0) return []
 
-  const initialRois: RoiCrop[] = regions
-    .filter((region: any) =>
-      ['answer', 'table_cell', 'working'].includes(String(region?.kind ?? 'answer'))
-    )
-    .map((region: any) => {
-      const kind = String(region?.kind ?? 'answer')
-      const bbox = normalizeBBox(region)
-
-      return {
-        roi_id: normalizeRoiId(region),
-        page_number: Number(pageNumber),
-        kind,
-        item_no: asNullableString(region?.item_no),
-        question_no: asNullableString(region?.question_no),
-        answer_type: asNullableString(region?.answer_type ?? region?.kind ?? 'text'),
-        points: region?.points != null ? asNumber(region.points, 0) : null,
-        score_weight:
-          region?.score_weight != null
-            ? asNumber(region.score_weight, 1)
-            : region?.points != null
-            ? asNumber(region.points, 1)
-            : 1,
-        bbox_norm: bbox,
-        crop_storage_path: null,
-      }
-    })
-    .filter((roi: RoiCrop) => roi.bbox_norm !== null)
-    .sort(compareRoiOrder)
-
-  if (initialRois.length === 0) {
-    return []
-  }
-
-  const pageFile = ctx.pages.find(
-    (p) => Number(p.page_number) === Number(pageNumber)
-  )
-
+  const pageFile = ctx.pages.find((p) => Number(p.page_number) === Number(pageNumber))
   if (!pageFile?.storage_path) {
     return initialRois.map((roi) => ({
       ...roi,
-      bbox_norm: roi.bbox_norm ? applyFallbackInset(roi.bbox_norm, roi.kind) : null,
+      bbox_norm: roi.bbox_norm ? fallbackInset(roi.bbox_norm) : null,
     }))
   }
 
   try {
     const pageBuffer = await downloadPageBuffer(pageFile.storage_path)
-    const grayPage = await loadGrayPage(pageBuffer)
+    const gray = await loadGrayPage(pageBuffer)
 
-    const answerColumn = buildAnswerColumnBounds(initialRois)
-    const rowBands = buildRowBands(initialRois)
+    const answerColumnNorm = buildAnswerColumnRange(initialRois)
+    let answerColumnPx: [number, number] | null = null
 
-    const refined = initialRois.map((roi, index) => {
-      const bbox = roi.bbox_norm
-      if (!bbox) return roi
+    if (answerColumnNorm) {
+      answerColumnPx = [
+        clampInt(Math.floor(answerColumnNorm[0] * gray.width), 0, gray.width - 1),
+        clampInt(Math.ceil(answerColumnNorm[1] * gray.width), 1, gray.width),
+      ]
+    }
 
-      const search = buildSearchBox(bbox, rowBands[index], answerColumn)
-      const snapped = snapInkBoxWithinSearch(grayPage, search)
+    if (answerColumnPx) {
+      const candidateLines = detectVerticalDarkLines(gray, answerColumnPx[0], answerColumnPx[1])
+
+      if (candidateLines.length >= 2) {
+        const left = candidateLines[0]
+        const right = candidateLines[candidateLines.length - 1]
+
+        if (right - left > 40) {
+          const colInset = Math.max(8, Math.floor((right - left) * 0.05))
+          answerColumnPx = [left + colInset, right - colInset]
+        }
+      }
+    }
+
+    const rowLines = detectHorizontalTableLines(gray, answerColumnPx)
+
+    const refined = initialRois.map((roi) => {
+      if (!roi.bbox_norm) return roi
+
+      const anchoredCell = deriveAnchoredCell(gray, roi, rowLines, answerColumnPx)
+      if (!anchoredCell) {
+        return {
+          ...roi,
+          bbox_norm: fallbackInset(roi.bbox_norm),
+        }
+      }
+
+      const components = findInkComponentsInBox(gray, anchoredCell)
+      const best = chooseBestInkComponent(components, gray, anchoredCell)
+
+      if (!best) {
+        return {
+          ...roi,
+          bbox_norm: fallbackInset(anchoredCell),
+        }
+      }
+
+      const anchoredCellPx = normToPx(gray, anchoredCell)
+      const merged = expandByNearbyComponents(best, components, anchoredCellPx)
+      const finalBox = expandComponentBox(gray, merged, anchoredCell)
 
       return {
         ...roi,
-        bbox_norm: snapped ?? applyFallbackInset(bbox, roi.kind),
+        bbox_norm: finalBox,
       }
     })
 
     return refined
   } catch (error) {
-    console.warn('[worker] cropRoisForPage alignment fallback', {
+    console.warn('[worker] cropRoisForPage production fallback', {
       submissionId: ctx.submission.id,
       pageNumber,
       error: error instanceof Error ? error.message : String(error),
@@ -444,7 +852,7 @@ export async function cropRoisForPage(
 
     return initialRois.map((roi) => ({
       ...roi,
-      bbox_norm: roi.bbox_norm ? applyFallbackInset(roi.bbox_norm, roi.kind) : null,
+      bbox_norm: roi.bbox_norm ? fallbackInset(roi.bbox_norm) : null,
     }))
   }
 }

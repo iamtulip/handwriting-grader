@@ -190,8 +190,8 @@ function parseValue(value: string): ParsedValue | null {
       /^-?\d+\.0+$/.test(normalized)
         ? String(Number(normalized))
         : normalized.endsWith('.')
-        ? normalized.slice(0, -1)
-        : normalized
+          ? normalized.slice(0, -1)
+          : normalized
 
     return {
       kind: 'number',
@@ -262,12 +262,10 @@ function detectExpectedAnswerType(
   return 'text'
 }
 
-function normalizeExpectedTolerance(answerKeyItem: WorkerAnswerItem | null): number {
+function normalizeExpectedTolerance(answerKeyItem: WorkerAnswerKeyItem | null): number {
   const t = Number((answerKeyItem as any)?.tolerance ?? 1e-9)
   return Number.isFinite(t) && t >= 0 ? t : 1e-9
 }
-
-type WorkerAnswerItem = WorkerAnswerKeyItem
 
 function unitsEquivalent(a: string | null, b: string | null): boolean {
   if (!a && !b) return true
@@ -383,6 +381,15 @@ function commonPrefixLength(a: string, b: string): number {
   return i
 }
 
+function normalizedTextLengthScore(value: string): number {
+  const digits = (value.match(/\d/g) ?? []).length
+  if (digits >= 6) return 1
+  if (digits === 5) return 0.75
+  if (digits === 4) return 0.45
+  if (digits === 3) return 0.15
+  return 0
+}
+
 function approximateSimilarity(
   candidateRaw: string,
   expectedValues: string[],
@@ -418,7 +425,8 @@ function approximateSimilarity(
       const relErr = Math.abs(candVal - expVal) / denom
       const prefix = commonPrefixLength(candidate.normalized, expected.normalized)
       const prefixBonus = Math.min(prefix, 8) * 0.08
-      const score = 1.2 - Math.min(relErr, 2) + prefixBonus
+      const lengthBonus = normalizedTextLengthScore(candidate.normalized) * 0.25
+      const score = 1.2 - Math.min(relErr, 2) + prefixBonus + lengthBonus
       best = Math.max(best, score)
       continue
     }
@@ -432,12 +440,26 @@ function approximateSimilarity(
   return best
 }
 
+function engineBonus(candidate: PersistedCandidate): number {
+  const engine = String((candidate as any)?.engine_source ?? '')
+  let bonus = 0
+
+  if (engine.includes(':token_decimal')) bonus += 0.12
+  if (engine.includes(':token_thousands')) bonus += 0.10
+  if (engine.includes(':token_raw')) bonus += 0.08
+  if (engine.includes(':token_no_comma')) bonus += 0.06
+  if (engine.includes(':math_parser')) bonus += 0.05
+  if (engine.includes(':original')) bonus += 0.01
+
+  return bonus
+}
+
 function candidateRankScore(candidate: PersistedCandidate): number {
   const confidence = Number(candidate?.confidence_score ?? 0)
   const normalized = String(candidate?.normalized_value ?? '')
   const rankPenalty = Math.min(Number((candidate as any)?.rank ?? 1), 50) * 0.001
-  const lengthBonus = Math.min(normalized.length, 12) * 0.01
-  return confidence + lengthBonus - rankPenalty
+  const lengthBonus = normalizedTextLengthScore(normalized) * 0.08
+  return confidence + engineBonus(candidate) + lengthBonus - rankPenalty
 }
 
 function chooseFallbackCandidate(

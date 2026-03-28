@@ -71,9 +71,9 @@ function clamp01(value: number): number {
 }
 
 function normalizeFallbackText(s: string): string {
-  return s
+  return String(s ?? '')
     .replace(/\s+/g, '')
-    .replace(/[，,]/g, '')
+    .replace(/[，]/g, ',')
     .replace(/[Oo๐]/g, '0')
     .replace(/[lI|]/g, '1')
     .replace(/[Ss]/g, '5')
@@ -247,6 +247,97 @@ async function runGoogleVisionOnBuffer(
   ]
 }
 
+function extractLooseNumericTokens(text: string): string[] {
+  const cleaned = String(text ?? '')
+    .replace(/[^\d,\.\-\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  if (!cleaned) return []
+
+  const parts = cleaned
+    .split(' ')
+    .map((x) => x.trim())
+    .filter(Boolean)
+
+  return Array.from(new Set(parts))
+}
+
+function normalizeNumericToken(token: string): string {
+  return String(token ?? '')
+    .replace(/\s+/g, '')
+    .replace(/[，]/g, ',')
+    .replace(/[Oo๐]/g, '0')
+    .replace(/[lI|]/g, '1')
+    .replace(/[Ss]/g, '5')
+    .replace(/−/g, '-')
+    .trim()
+}
+
+function buildNumericCandidatesFromToken(
+  token: string,
+  baseConfidence: number,
+  engineSource: string
+): OcrCandidate[] {
+  const out: OcrCandidate[] = []
+  const normalized = normalizeNumericToken(token)
+  if (!normalized) return out
+
+  const tokenHasComma = normalized.includes(',')
+  const tokenHasDot = normalized.includes('.')
+  const digitsOnly = normalized.replace(/[^\d\-]/g, '')
+  const noComma = normalized.replace(/,/g, '')
+
+  if (normalized) {
+    out.push({
+      raw_text: token,
+      normalized_value: normalized,
+      confidence_score: clamp01(baseConfidence),
+      engine_source: `${engineSource}:token_raw`,
+    })
+  }
+
+  if (noComma && noComma !== normalized) {
+    out.push({
+      raw_text: token,
+      normalized_value: noComma,
+      confidence_score: clamp01(baseConfidence - 0.02),
+      engine_source: `${engineSource}:token_no_comma`,
+    })
+  }
+
+  if (digitsOnly && digitsOnly !== noComma) {
+    out.push({
+      raw_text: token,
+      normalized_value: digitsOnly,
+      confidence_score: clamp01(baseConfidence - 0.05),
+      engine_source: `${engineSource}:token_digits_only`,
+    })
+  }
+
+  // กรณีเลขเขียนเป็นกลุ่มพัน เช่น 552,630 หรือ 180,100
+  if (tokenHasComma && !tokenHasDot && /^\-?\d{1,3}(,\d{3})+$/.test(normalized)) {
+    out.push({
+      raw_text: token,
+      normalized_value: normalized,
+      confidence_score: clamp01(baseConfidence + 0.03),
+      engine_source: `${engineSource}:token_thousands`,
+    })
+  }
+
+  // กรณีอาจเป็นทศนิยมจริง เช่น 324,729.65
+  if (tokenHasComma && tokenHasDot && /^\-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(normalized)) {
+    out.push({
+      raw_text: token,
+      normalized_value: normalized,
+      confidence_score: clamp01(baseConfidence + 0.04),
+      engine_source: `${engineSource}:token_decimal`,
+    })
+  }
+
+  return out
+}
+
 function buildLineAwareCandidates(
   rawText: string,
   baseConfidence: number,
@@ -263,20 +354,32 @@ function buildLineAwareCandidates(
     const linePenalty = i * 0.04
     const adjustedConfidence = clamp01(baseConfidence + lineBias - linePenalty)
 
+    // 1) parser เดิม
     const parsed = parseMathCandidatesFromOcr(line, adjustedConfidence)
-
     if (parsed.length > 0) {
       for (const p of parsed) {
         candidates.push({
           raw_text: p.raw_text,
           normalized_value: p.normalized_value,
           confidence_score: clamp01(p.confidence_score),
-          engine_source: engineSource,
+          engine_source: `${engineSource}:math_parser`,
         })
       }
-      continue
     }
 
+    // 2) token-level numeric candidates
+    const tokens = extractLooseNumericTokens(line)
+    for (const token of tokens) {
+      candidates.push(
+        ...buildNumericCandidatesFromToken(
+          token,
+          adjustedConfidence * 0.95,
+          `${engineSource}:line_token`
+        )
+      )
+    }
+
+    // 3) fallback ทั้งบรรทัด
     const fallbackNormalized = normalizeFallbackText(line)
     if (fallbackNormalized) {
       candidates.push({
@@ -288,27 +391,62 @@ function buildLineAwareCandidates(
     }
   }
 
-  // ถ้ามีแค่บรรทัดเดียว ค่อยเก็บทั้งก้อนเป็น fallback
-  if (candidates.length === 0 && lines.length <= 1) {
-    const fallback = normalizeFallbackText(rawText)
-    if (fallback) {
-      candidates.push({
-        raw_text: rawText.trim(),
-        normalized_value: fallback,
-        confidence_score: clamp01(baseConfidence * 0.65),
-        engine_source: `${engineSource}:fallback_block`,
-      })
-    }
+  // 4) block-level fallback
+  const fallbackBlock = normalizeFallbackText(rawText)
+  if (fallbackBlock) {
+    candidates.push({
+      raw_text: rawText.trim(),
+      normalized_value: fallbackBlock,
+      confidence_score: clamp01(baseConfidence * 0.68),
+      engine_source: `${engineSource}:fallback_block`,
+    })
   }
 
-  return candidates
+  // 5) block-level token extraction
+  const blockTokens = extractLooseNumericTokens(rawText)
+  for (const token of blockTokens) {
+    candidates.push(
+      ...buildNumericCandidatesFromToken(
+        token,
+        baseConfidence * 0.9,
+        `${engineSource}:block_token`
+      )
+    )
+  }
+
+  return dedupeCandidates(candidates)
 }
 
 function candidateSortScore(candidate: OcrCandidate): number {
   const conf = Number(candidate.confidence_score ?? 0)
-  const lenPenalty = Math.min(String(candidate.normalized_value ?? '').length, 40) * 0.0025
-  const engineBonus = String(candidate.engine_source ?? '').includes(':original') ? 0.01 : 0
-  return conf + engineBonus - lenPenalty
+  const normalized = String(candidate.normalized_value ?? '')
+  const engine = String(candidate.engine_source ?? '')
+
+  const len = normalized.length
+  const digitCount = (normalized.match(/\d/g) ?? []).length
+
+  let score = conf
+
+  if (engine.includes(':math_parser')) score += 0.06
+  if (engine.includes(':token_raw')) score += 0.05
+  if (engine.includes(':token_no_comma')) score += 0.04
+  if (engine.includes(':token_thousands')) score += 0.05
+  if (engine.includes(':token_decimal')) score += 0.06
+  if (engine.includes(':original')) score += 0.01
+
+  // ลงโทษ candidate สั้นเกินไป เช่น 150, 791
+  if (digitCount <= 3) score -= 0.20
+  else if (digitCount <= 4) score -= 0.12
+  else if (digitCount <= 5) score -= 0.05
+
+  // ให้คะแนนกับรูปแบบที่ดูเป็นเลขจริง
+  if (/^\-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(normalized)) score += 0.05
+  if (/^\-?\d+(\.\d+)?$/.test(normalized)) score += 0.03
+
+  // ลงโทษ candidate ยาวเว่อร์ผิดปกติ
+  if (len > 12) score -= Math.min(0.12, (len - 12) * 0.01)
+
+  return score
 }
 
 export async function runOcrEnsembleForRoi(
@@ -443,6 +581,14 @@ export async function runOcrEnsembleForRoi(
     .sort((a, b) => candidateSortScore(b) - candidateSortScore(a))
 
   const deduped = dedupeCandidates(cleaned)
+
+  console.log('[worker] OCR candidate debug', {
+    roi_id: roi.roi_id,
+    page_number: roi.page_number,
+    raw_candidates_top10: candidates.slice(0, 10),
+    cleaned_top10: cleaned.slice(0, 10),
+    deduped_top10: deduped.slice(0, 10),
+  })
 
   console.log('[worker] OCR ensemble result', {
     roi_id: roi.roi_id,
